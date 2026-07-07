@@ -287,6 +287,28 @@ audio { width: 100%; height: 30px; accent-color: #111; }
 .btn-dl:hover { border-color: #111; color: #111; }
 
 .panel-msg { padding: 48px 24px; text-align: center; color: var(--ink-light); font-family: 'Inter', sans-serif; font-size: 13px; }
+
+/* ── Waveform skyline view ── */
+.skyline-overlay {
+  position: fixed; inset: 0; background: #fff; z-index: 2500;
+  display: flex; flex-direction: column; animation: fadeIn .2s;
+}
+.sky-head {
+  padding: 22px 30px 8px; display: flex; align-items: flex-start;
+  justify-content: space-between; flex-shrink: 0;
+}
+.sky-head h3 { font-family: 'Space Grotesk', 'Inter', sans-serif; font-size: 20px; font-weight: 700; color: #111; }
+.sky-head p { font-size: 12px; color: var(--ink-light); margin-top: 3px; }
+.sky-close { background: none; border: none; cursor: pointer; color: var(--ink-light); font-size: 26px; line-height: 1; padding: 2px 6px; }
+.sky-close:hover { color: #111; }
+.sky-canvas-wrap { flex: 1; position: relative; min-height: 0; }
+.sky-canvas { width: 100%; height: 100%; display: block; cursor: default; }
+.sky-tip {
+  position: absolute; pointer-events: none; background: #111; color: #fff;
+  font-size: 11px; padding: 5px 10px; border-radius: 8px; white-space: nowrap;
+  transform: translate(-50%, -130%); opacity: 0; transition: opacity .12s;
+}
+.sky-status { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 13px; color: var(--ink-light); }
 </style>
 </head>
 <body>
@@ -313,6 +335,7 @@ audio { width: 100%; height: 30px; accent-color: #111; }
       </svg>
     </div>
     <div class="header-actions">
+      <button class="btn btn-gen" id="btn-sky" title="waveform skyline">skyline</button>
       <button class="btn btn-gen" id="btn-gen" title="compose from sounds">♪</button>
       <div class="city-picker" id="city-picker">
         <button class="btn btn-city" id="btn-city">
@@ -737,6 +760,178 @@ function openRecordModal() {
 }
 
 /* ── Music generator panel ── */
+/* ── Waveform skyline: the city as one continuous audio signal ── */
+document.getElementById('btn-sky').addEventListener('click', openSkyline);
+let skyClose = null;
+
+async function openSkyline() {
+  if (skyClose) { skyClose(); return; }
+
+  const overlay = el('div', { class: 'skyline-overlay' });
+  const head = el('div', { class: 'sky-head' },
+    el('div', {},
+      el('h3', {}, 'the city, west to east'),
+      el('p', {}, 'every recording drawn as its actual waveform, placed at its longitude — click a burst to listen')),
+    el('button', { class: 'sky-close', onclick: () => skyClose && skyClose() }, '×')
+  );
+  const wrap = el('div', { class: 'sky-canvas-wrap' });
+  const canvas = el('canvas', { class: 'sky-canvas' });
+  const tip = el('div', { class: 'sky-tip' });
+  const status = el('div', { class: 'sky-status' }, 'decoding the city…');
+  wrap.append(canvas, tip, status);
+  overlay.append(head, wrap);
+  document.body.appendChild(overlay);
+
+  let player = null, raf = null, segments = [], playingIdx = -1;
+  skyClose = () => {
+    if (player) { player.pause(); player = null; }
+    if (raf) cancelAnimationFrame(raf);
+    window.removeEventListener('resize', draw);
+    overlay.remove(); skyClose = null;
+  };
+
+  // fetch + decode every recording
+  let clips = [];
+  try {
+    const recs = await fetch(`${API}/api/recordings`).then(r => r.json());
+    if (!recs.length) { status.textContent = 'no recordings yet'; return; }
+    const AC = new (window.AudioContext || window.webkitAudioContext)();
+    clips = (await Promise.all(recs.slice(0, 24).map(async rec => {
+      try {
+        const ab = await fetch(`${API}/uploads/${rec.filename}`).then(r => r.arrayBuffer());
+        const buf = await AC.decodeAudioData(ab);
+        return { rec, buf };
+      } catch { return null; }
+    }))).filter(Boolean);
+    await AC.close();
+  } catch { status.textContent = 'could not load recordings'; return; }
+  if (!clips.length) { status.textContent = 'could not decode recordings'; return; }
+  status.remove();
+
+  clips.sort((a, b) => a.rec.lng - b.rec.lng);
+  const lngs = clips.map(c => c.rec.lng);
+  const minLng = Math.min(...lngs), maxLng = Math.max(...lngs), span = maxLng - minLng || 1;
+
+  function layout(W) {
+    const padL = 50, padR = 50, gap = 22;
+    const n = clips.length;
+    // guarantee everything fits with visible flat line between bursts
+    const segW = Math.max(28, Math.min(110, (W - padL - padR - gap * (n - 1)) / n));
+    segments = clips.map(c => ({
+      c, w: segW,
+      x: padL + ((c.rec.lng - minLng) / span) * (W - padL - padR - segW),
+    }));
+    // forward pass: enforce minimum gap left→right
+    for (let i = 1; i < n; i++) {
+      const prev = segments[i - 1];
+      if (segments[i].x < prev.x + prev.w + gap) segments[i].x = prev.x + prev.w + gap;
+    }
+    // backward pass: clamp to right edge, push earlier segments left if needed
+    segments[n - 1].x = Math.min(segments[n - 1].x, W - padR - segW);
+    for (let i = n - 2; i >= 0; i--) {
+      const next = segments[i + 1];
+      if (segments[i].x + segW + gap > next.x) segments[i].x = next.x - gap - segW;
+    }
+  }
+
+  function draw(highlightIdx = -1, playX = null) {
+    const W = wrap.clientWidth, H = wrap.clientHeight, dpr = devicePixelRatio || 1;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, W, H);
+    layout(W);
+
+    const base = H * 0.5, amp = H * 0.3;
+    ctx.lineWidth = 1.3; ctx.lineJoin = 'round'; ctx.strokeStyle = '#111';
+    ctx.beginPath();
+    ctx.moveTo(0, base);
+    for (let si = 0; si < segments.length; si++) {
+      const { c, x, w } = segments[si];
+      ctx.lineTo(x, base);
+      const raw = c.buf.getChannelData(0);
+      let peak = 0; for (let i = 0; i < raw.length; i += 50) peak = Math.max(peak, Math.abs(raw[i]));
+      const norm = peak ? 0.95 / peak : 1;
+      const pts = Math.floor(w * 2);
+      for (let i = 0; i < pts; i++) {
+        const v = raw[Math.floor(i * raw.length / pts)] * norm;
+        ctx.lineTo(x + (i / pts) * w, base - v * amp * (si === highlightIdx ? 1 : 0.85));
+      }
+      ctx.lineTo(x + w, base);
+    }
+    ctx.lineTo(W, base);
+    ctx.stroke();
+
+    // labels + highlight underline
+    ctx.textAlign = 'center';
+    for (let si = 0; si < segments.length; si++) {
+      const { c, x, w } = segments[si];
+      const hi = si === highlightIdx || si === playingIdx;
+      const ly = base + amp + (si % 2 ? 44 : 26); // stagger rows so labels never collide
+      ctx.fillStyle = hi ? '#111' : '#9a9a9a';
+      ctx.font = `${hi ? '700 ' : ''}10px Inter, sans-serif`;
+      ctx.fillText(((c.rec.tags && c.rec.tags[0]) || 'sound').toUpperCase(), x + w / 2, ly);
+      if (hi) {
+        ctx.strokeStyle = '#111'; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(x, ly + 7); ctx.lineTo(x + w, ly + 7); ctx.stroke();
+        ctx.lineWidth = 1.3;
+      }
+    }
+    // west/east markers
+    ctx.fillStyle = '#c2c2c2'; ctx.font = '10px Inter, sans-serif';
+    ctx.textAlign = 'left';  ctx.fillText('W ◀', 18, base - amp - 14);
+    ctx.textAlign = 'right'; ctx.fillText('▶ E', W - 18, base - amp - 14);
+
+    // playhead
+    if (playX !== null) {
+      ctx.strokeStyle = '#111'; ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(playX, base - amp - 4); ctx.lineTo(playX, base + amp + 8); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+
+  function segAt(mx) {
+    return segments.findIndex(s => mx >= s.x - 4 && mx <= s.x + s.w + 4);
+  }
+
+  canvas.addEventListener('mousemove', e => {
+    const r = canvas.getBoundingClientRect();
+    const idx = segAt(e.clientX - r.left);
+    canvas.style.cursor = idx >= 0 ? 'pointer' : 'default';
+    if (idx >= 0) {
+      const { c, x, w } = segments[idx];
+      tip.textContent = `${(c.rec.tags || []).join(' · ')} — ${new Date(c.rec.timestamp).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`;
+      tip.style.left = (x + w / 2) + 'px';
+      tip.style.top = (wrap.clientHeight * 0.5 - wrap.clientHeight * 0.3 - 8) + 'px';
+      tip.style.opacity = 1;
+    } else tip.style.opacity = 0;
+    if (playingIdx < 0) draw(idx);
+  });
+  canvas.addEventListener('mouseleave', () => { tip.style.opacity = 0; if (playingIdx < 0) draw(); });
+
+  canvas.addEventListener('click', e => {
+    const r = canvas.getBoundingClientRect();
+    const idx = segAt(e.clientX - r.left);
+    if (idx < 0) return;
+    if (player) { player.pause(); player = null; }
+    if (raf) cancelAnimationFrame(raf);
+    playingIdx = idx;
+    const seg = segments[idx];
+    player = new Audio(`${API}/uploads/${seg.c.rec.filename}`);
+    player.play();
+    const step = () => {
+      if (!player || player.ended || player.paused) { playingIdx = -1; draw(); return; }
+      draw(idx, seg.x + (player.currentTime / (player.duration || 1)) * seg.w);
+      raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+  });
+
+  window.addEventListener('resize', () => draw());
+  draw();
+}
+
 document.getElementById('btn-gen').addEventListener('click', openMusicPanel);
 let musicUnmount = null;
 
