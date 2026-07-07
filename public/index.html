@@ -340,6 +340,7 @@ audio { width: 100%; height: 30px; accent-color: #111; }
       </svg>
     </div>
     <div class="header-actions">
+      <button class="btn btn-tool" id="btn-rings" title="the city's sounds as growth rings"><span class="tool-glyph">◎</span> rings</button>
       <button class="btn btn-tool" id="btn-sky" title="the city as one waveform"><span class="tool-glyph">≈</span> skyline</button>
       <button class="btn btn-tool" id="btn-gen" title="generate a house track from the recordings"><span class="tool-glyph">♪</span> generate</button>
       <div class="city-picker" id="city-picker">
@@ -771,6 +772,7 @@ let skyClose = null;
 
 async function openSkyline() {
   if (skyClose) { skyClose(); return; }
+  if (ringsClose) ringsClose();
 
   const overlay = el('div', { class: 'skyline-overlay' });
   const head = el('div', { class: 'sky-head' },
@@ -928,6 +930,207 @@ async function openSkyline() {
     const step = () => {
       if (!player || player.ended || player.paused) { playingIdx = -1; draw(); return; }
       draw(idx, seg.x + (player.currentTime / (player.duration || 1)) * seg.w);
+      raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+  });
+
+  window.addEventListener('resize', () => draw());
+  draw();
+}
+
+/* ── Rings: the city's sounds as growth rings on a 24-hour polar clock ──
+   inspired by tree-ring / polar-time archives: angle = time of day,
+   radius = age (newest rings outermost), each burst = the real waveform */
+document.getElementById('btn-rings').addEventListener('click', openRings);
+let ringsClose = null;
+
+function promptFor(rec) {
+  const t = (rec.tags || []).join(' ');
+  const hr = new Date(rec.timestamp).getHours();
+  if (/birds|pigeon/.test(t)) return 'the birds start before the traffic does — when did you last hear the first one?';
+  if (/rain/.test(t))         return 'rain sounds different on every street — where does it land near you?';
+  if (/children|play/.test(t))return 'a playground is the loudest kind of joy — walk past one without headphones.';
+  if (/siren/.test(t))        return 'a siren passes through every life in this city — notice where yours crosses it.';
+  if (/subway/.test(t))       return 'the city hums underneath — next platform, listen before the train arrives.';
+  if (/bells|chimes/.test(t)) return 'somewhere a bell still marks the hour — can you hear one from your block?';
+  if (/dog/.test(t))          return 'every block has a voice that isn\'t human — who speaks on yours?';
+  if (hr < 6)  return `this was ${hr}am — the city before dawn is a different animal. hear it once.`;
+  if (hr < 12) return 'morning has a sound signature — step outside and learn your block\'s.';
+  if (hr < 18) return 'the afternoon din hides small sounds — stop for thirty seconds and count them.';
+  return 'evening softens the city — take the long way home and listen.';
+}
+
+async function openRings() {
+  if (ringsClose) { ringsClose(); return; }
+  if (skyClose) skyClose();
+
+  const overlay = el('div', { class: 'skyline-overlay' });
+  const head = el('div', { class: 'sky-head' },
+    el('div', {},
+      el('h3', {}, 'the city\'s rings'),
+      el('p', {}, 'a day of listening, drawn in polar time — angle is the hour a sound was captured, newer rings sit further out. click a burst to listen')),
+    el('button', { class: 'sky-close', onclick: () => ringsClose && ringsClose() }, '×')
+  );
+  const wrap = el('div', { class: 'sky-canvas-wrap' });
+  const canvas = el('canvas', { class: 'sky-canvas' });
+  const tip = el('div', { class: 'sky-tip' });
+  const status = el('div', { class: 'sky-status' }, 'decoding the city…');
+  const caption = el('div', { style: 'flex-shrink:0;text-align:center;padding:14px 30px 22px;font-size:12px;color:var(--ink-light);font-style:italic;min-height:44px;' });
+  wrap.append(canvas, tip, status);
+  overlay.append(head, wrap, caption);
+  document.body.appendChild(overlay);
+
+  let player = null, raf = null, nodes = [], playingIdx = -1;
+  ringsClose = () => {
+    if (player) { player.pause(); player = null; }
+    if (raf) cancelAnimationFrame(raf);
+    window.removeEventListener('resize', draw);
+    overlay.remove(); ringsClose = null;
+  };
+
+  let clips = [];
+  try {
+    const recs = await fetch(`${API}/api/recordings`).then(r => r.json());
+    if (!recs.length) { status.textContent = 'no recordings yet'; return; }
+    const AC = new (window.AudioContext || window.webkitAudioContext)();
+    clips = (await Promise.all(recs.slice(0, 24).map(async rec => {
+      try {
+        const ab = await fetch(`${API}/uploads/${rec.filename}`).then(r => r.arrayBuffer());
+        const buf = await AC.decodeAudioData(ab);
+        return { rec, buf };
+      } catch { return null; }
+    }))).filter(Boolean);
+    await AC.close();
+  } catch { status.textContent = 'could not load recordings'; return; }
+  if (!clips.length) { status.textContent = 'could not decode recordings'; return; }
+  status.remove();
+
+  const times = clips.map(c => +new Date(c.rec.timestamp));
+  const newest = Math.max(...times), oldest = Math.min(...times);
+  const ageSpan = newest - oldest || 1;
+
+  function draw(highlightIdx = -1, playFrac = null) {
+    const W = wrap.clientWidth, H = wrap.clientHeight, dpr = devicePixelRatio || 1;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, W, H);
+
+    const cx = W / 2, cy = H / 2;
+    const Rin = Math.min(W, H) * 0.14, Rout = Math.min(W, H) * 0.40;
+    const amp = Math.min(W, H) * 0.055;
+
+    // hour ticks + labels
+    ctx.strokeStyle = '#e2e2e2'; ctx.fillStyle = '#b5b5b5';
+    ctx.font = '10px Inter, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    for (let h = 0; h < 24; h += 6) {
+      const a = (h / 24) * Math.PI * 2 - Math.PI / 2;
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(a) * (Rin - 14), cy + Math.sin(a) * (Rin - 14));
+      ctx.lineTo(cx + Math.cos(a) * (Rout + amp + 8), cy + Math.sin(a) * (Rout + amp + 8));
+      ctx.stroke();
+      const lbl = h === 0 ? '12a' : h === 12 ? '12p' : (h % 12) + (h < 12 ? 'a' : 'p');
+      ctx.fillText(lbl, cx + Math.cos(a) * (Rout + amp + 24), cy + Math.sin(a) * (Rout + amp + 24));
+    }
+
+    nodes = [];
+    for (let i = 0; i < clips.length; i++) {
+      const { rec, buf } = clips[i];
+      const d = new Date(rec.timestamp);
+      const dayFrac = (d.getHours() + d.getMinutes() / 60) / 24;
+      const theta = dayFrac * Math.PI * 2 - Math.PI / 2;
+      const age = (newest - +d) / ageSpan;            // 0 = newest
+      const r = Rout - age * (Rout - Rin);
+      const hi = i === highlightIdx || i === playingIdx;
+
+      // the recording's full ring — faint dotted circle at its radius (its growth ring)
+      ctx.strokeStyle = hi ? '#999' : '#ececec'; ctx.lineWidth = 1;
+      ctx.setLineDash([1.5, 5]);
+      ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
+      ctx.setLineDash([]);
+
+      // waveform burst along the arc at its hour
+      const raw = buf.getChannelData(0);
+      let peak = 0; for (let k = 0; k < raw.length; k += 50) peak = Math.max(peak, Math.abs(raw[k]));
+      const norm = peak ? 0.95 / peak : 1;
+      const arcW = Math.PI / 10;                      // ~18° of arc per burst
+      const pts = 160;
+      ctx.strokeStyle = '#111'; ctx.lineWidth = hi ? 1.6 : 1.1;
+      ctx.beginPath();
+      for (let k = 0; k <= pts; k++) {
+        const f = k / pts;
+        const a = theta - arcW / 2 + f * arcW;
+        const v = raw[Math.floor(f * (raw.length - 1))] * norm;
+        const rr = r + v * amp * (hi ? 1 : 0.8);
+        const x = cx + Math.cos(a) * rr, y = cy + Math.sin(a) * rr;
+        k === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+
+      // tag label just outside the burst
+      const lx = cx + Math.cos(theta) * (r + amp + 13), ly = cy + Math.sin(theta) * (r + amp + 13);
+      ctx.fillStyle = hi ? '#111' : '#9a9a9a';
+      ctx.font = `${hi ? '700 ' : ''}9px Inter, sans-serif`;
+      ctx.fillText(((rec.tags && rec.tags[0]) || 'sound').toUpperCase(), lx, ly);
+
+      // playhead: a dot travelling along the burst
+      if (i === playingIdx && playFrac !== null) {
+        const a = theta - arcW / 2 + playFrac * arcW;
+        ctx.fillStyle = '#111';
+        ctx.beginPath(); ctx.arc(cx + Math.cos(a) * r, cy + Math.sin(a) * r, 3.5, 0, Math.PI * 2); ctx.fill();
+      }
+
+      nodes.push({ x: cx + Math.cos(theta) * r, y: cy + Math.sin(theta) * r, i });
+    }
+
+    // center: count, like the heart of the core sample
+    ctx.fillStyle = '#111';
+    ctx.font = '700 22px Space Grotesk, Inter, sans-serif';
+    ctx.fillText(String(clips.length), cx, cy - 8);
+    ctx.fillStyle = '#9a9a9a'; ctx.font = '9px Inter, sans-serif';
+    ctx.fillText('SOUNDS IN', cx, cy + 12);
+    ctx.fillText('THE ARCHIVE', cx, cy + 24);
+  }
+
+  function nodeAt(mx, my) {
+    let best = -1, bd = 32 * 32;
+    for (const n of nodes) {
+      const d = (n.x - mx) ** 2 + (n.y - my) ** 2;
+      if (d < bd) { bd = d; best = n.i; }
+    }
+    return best;
+  }
+
+  canvas.addEventListener('mousemove', e => {
+    const r = canvas.getBoundingClientRect();
+    const idx = nodeAt(e.clientX - r.left, e.clientY - r.top);
+    canvas.style.cursor = idx >= 0 ? 'pointer' : 'default';
+    if (idx >= 0) {
+      const c = clips[idx];
+      tip.textContent = `${(c.rec.tags || []).join(' · ')} — ${new Date(c.rec.timestamp).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`;
+      const n = nodes.find(n => n.i === idx);
+      tip.style.left = n.x + 'px'; tip.style.top = (n.y - 14) + 'px';
+      tip.style.opacity = 1;
+    } else tip.style.opacity = 0;
+    if (playingIdx < 0) draw(idx);
+  });
+  canvas.addEventListener('mouseleave', () => { tip.style.opacity = 0; if (playingIdx < 0) draw(); });
+
+  canvas.addEventListener('click', e => {
+    const r = canvas.getBoundingClientRect();
+    const idx = nodeAt(e.clientX - r.left, e.clientY - r.top);
+    if (idx < 0) return;
+    if (player) { player.pause(); player = null; }
+    if (raf) cancelAnimationFrame(raf);
+    playingIdx = idx;
+    const c = clips[idx];
+    caption.textContent = '“' + promptFor(c.rec) + '”';
+    player = new Audio(`${API}/uploads/${c.rec.filename}`);
+    player.play();
+    const step = () => {
+      if (!player || player.ended || player.paused) { playingIdx = -1; draw(); return; }
+      draw(idx, player.currentTime / (player.duration || 1));
       raf = requestAnimationFrame(step);
     };
     raf = requestAnimationFrame(step);
