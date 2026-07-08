@@ -17,6 +17,15 @@ The demo recordings seeded in the app are real field recordings from
 | Skateboard | Patineta en la Universidad de las Artes.wav | CC BY-SA 4.0 |
 | Pigeon (Midtown) | Dove cooing.ogg | Public domain |
 | Street traffic (Prospect Park) | Sunday in the city street noise3.ogg | Public domain |
+| Fountain (Bryant Park) | Sounds of fountain in Fribourg 01.ogg | CC BY-SA 4.0 |
+| Thunderstorm (Bronx) | Good thunderstorm Sept 8 2022.ogg | CC BY-SA 4.0 |
+| Helicopter (Downtown) | Chinook helicopter flying over Greenwich in London.ogg | CC0 |
+| Market (Williamsburg) | Flea market in the rain.ogg | Public domain |
+| Pipe organ (Riverside) | Hartford City Presbyterian Pipe Organ.ogg | Public domain |
+| Cat (East Village) | Meow of a pleading cat.oga | Public domain |
+| Crickets (Queens) | Ringing cricket winding down.ogg | CC BY-SA 4.0 |
+| Wind chimes (Park Slope) | Sound of Wind chime in slight breeze include daily life noises.ogg | CC BY-SA 3.0 |
+| Live music (Bushwick) | Agnes Palmisano Trio – Ane von da Wäsch (Live Brigittenau 2025).ogg | CC BY-SA 4.0 |
 
 Each source file can be found at
 `https://commons.wikimedia.org/wiki/File:<name>` — author details and full
