@@ -7,7 +7,7 @@ import json
 import math
 import sqlite3
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_from_directory, send_file
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -44,6 +44,37 @@ def init_db():
                 created   TEXT DEFAULT (datetime('now'))
             )
         """)
+    refresh_demo_timestamps()
+
+
+def refresh_demo_timestamps():
+    """Demo recordings ship with fixed timestamps that age out of the
+    'last hour / 24h' filters. On startup, if the newest sample is older
+    than 12h, slide all sample timestamps forward (keeping their relative
+    spacing) so the demo map always feels alive."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, timestamp FROM recordings WHERE filename LIKE 'sample_%'"
+        ).fetchall()
+        if not rows:
+            return
+        try:
+            times = {r["id"]: datetime.fromisoformat(r["timestamp"]) for r in rows}
+        except ValueError:
+            return
+        newest = max(times.values())
+        # naive local time: the frontend parses these strings as local,
+        # so anchoring to local now keeps displayed ages sensible
+        now = datetime.now()
+        age = (now - newest).total_seconds()
+        if 0 <= age < 12 * 3600:
+            return  # still fresh (negative age = future timestamps → re-anchor)
+        delta = now - newest - timedelta(minutes=30)  # newest lands ~30 min ago
+        for rec_id, ts in times.items():
+            conn.execute(
+                "UPDATE recordings SET timestamp = ? WHERE id = ?",
+                ((ts + delta).isoformat(), rec_id),
+            )
 
 
 def grid_cell_size(zoom: int) -> float:

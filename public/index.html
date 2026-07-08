@@ -340,8 +340,7 @@ audio { width: 100%; height: 30px; accent-color: #111; }
       </svg>
     </div>
     <div class="header-actions">
-      <button class="btn btn-tool" id="btn-sky" title="the city as one waveform"><span class="tool-glyph">≈</span> skyline</button>
-      <button class="btn btn-tool" id="btn-gen" title="generate a house track from the recordings"><span class="tool-glyph">♪</span> generate</button>
+      <button class="btn btn-tool" id="btn-gen" title="see the archive and generate a house track"><span class="tool-glyph">♪</span> generate</button>
       <div class="city-picker" id="city-picker">
         <button class="btn btn-city" id="btn-city">
           <span id="city-label">NYC</span>
@@ -639,6 +638,90 @@ function openTimeline(cell) {
 }
 
 /* ── Record modal ── */
+/* ── Auto-tagging: YAMNet (AudioSet, 521 classes) in the browser via tf.js.
+   Lazy-loaded on first recording; suggestions are editable like any tag. ── */
+let yamnetPromise = null;
+function loadScript(src) {
+  return new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = src; s.onload = res; s.onerror = () => rej(new Error('script load failed'));
+    document.head.appendChild(s);
+  });
+}
+async function loadYamnet() {
+  if (!yamnetPromise) yamnetPromise = (async () => {
+    if (!window.tf) await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js');
+    const model = await tf.loadGraphModel('https://tfhub.dev/google/tfjs-model/yamnet/tfjs/1', { fromTFHub: true });
+    const csv = await fetch('https://raw.githubusercontent.com/tensorflow/models/master/research/audioset/yamnet/yamnet_class_map.csv').then(r => r.text());
+    const names = csv.trim().split('\n').slice(1).map(l => l.split(',').slice(2).join(',').replace(/^"|"$/g, '').trim());
+    return { model, names };
+  })().catch(e => { yamnetPromise = null; throw e; });
+  return yamnetPromise;
+}
+
+// AudioSet display names → our tag vocabulary
+const AUTOTAG_RULES = [
+  [/pigeon|dove/i, 'pigeon'],
+  [/bird|chirp|tweet|crow|caw|owl/i, 'birds'],
+  [/dog|bark|bow-wow|growl|howl/i, 'dog'],
+  [/siren|ambulance|police car|fire engine/i, 'siren'],
+  [/subway|railroad|rail|train/i, 'subway'],
+  [/rain|drizzle/i, 'rain'],
+  [/stream|water|fountain|waves/i, 'water'],
+  [/crowd|hubbub|chatter|babble/i, 'crowd'],
+  [/child|children|kid/i, 'children'],
+  [/laugh/i, 'laugh'],
+  [/speech|conversation|narration|shout|yell/i, 'voices'],
+  [/music|singing|guitar|drum|jazz|piano|violin|instrument|choir/i, 'music'],
+  [/jackhammer|drill|hammer|sawing|power tool|construction/i, 'construction'],
+  [/skateboard/i, 'skateboard'],
+  [/church bell|bell|chime|ding/i, 'chimes'],
+  [/car|vehicle|traffic|truck|bus|engine|motorcycle|horn|honk/i, 'traffic'],
+  [/aircraft|airplane|helicopter/i, 'aircraft'],
+  [/wind/i, 'wind'],
+  [/thunder/i, 'thunder'],
+  [/footsteps|walking/i, 'footsteps'],
+  [/cat|meow/i, 'cat'],
+  [/insect|cricket|cicada/i, 'insects'],
+];
+
+async function suggestTags(blob) {
+  const { model, names } = await loadYamnet();
+  const ab = await blob.arrayBuffer();
+  const AC = new (window.AudioContext || window.webkitAudioContext)();
+  const buf = await AC.decodeAudioData(ab);
+  await AC.close();
+  // YAMNet expects 16 kHz mono
+  const off = new OfflineAudioContext(1, Math.ceil(buf.duration * 16000), 16000);
+  const src = off.createBufferSource(); src.buffer = buf;
+  src.connect(off.destination); src.start();
+  const r16 = await off.startRendering();
+  const wave = r16.getChannelData(0);
+
+  const pooled = tf.tidy(() => {
+    const out = model.predict(tf.tensor1d(wave)); // [scores, embeddings, spectrogram]
+    const s = Array.isArray(out) ? out[0] : out;
+    // blend mean and max over frames: mean rewards sustained sounds,
+    // max catches short events (a chirp, a bark) that dilute in the average
+    return s.mean(0).mul(0.5).add(s.max(0).mul(0.5));
+  });
+  const vals = await pooled.data();
+  pooled.dispose();
+
+  const order = [...vals.keys()].sort((a, b) => vals[b] - vals[a]).slice(0, 15);
+  const found = [];
+  for (const i of order) {
+    if (vals[i] < 0.1) break;                  // confidence floor
+    const name = names[i] || '';
+    if (/silence|noise|static|hiss|spray|steam|buzz|sine wave|inside|outside|sound effect|echo|reverberation/i.test(name)) continue;
+    for (const [re, tag] of AUTOTAG_RULES) {
+      if (re.test(name) && !found.includes(tag)) { found.push(tag); break; }
+    }
+    if (found.length >= 3) break;
+  }
+  return found;
+}
+
 document.getElementById('btn-rec').addEventListener('click', openRecordModal);
 
 /* ── City picker dropdown ── */
@@ -670,6 +753,7 @@ function openRecordModal() {
   const DURATION = 8;
   let phase = 'idle', location = null, audioBlob = null, audioUrl = null;
   let tags = [], recorder = null, timer = null;
+  let autoRan = false; const autoTagged = new Set();
 
   const NYC_SPOTS = [[40.7128,-74.006],[40.758,-73.9855],[40.7282,-73.7949],[40.6501,-73.9496],[40.8448,-73.8648]];
   const defLoc = () => { const [la,ln]=NYC_SPOTS[Math.floor(Math.random()*NYC_SPOTS.length)]; return {lat:la+(Math.random()-.5)*.008,lng:ln+(Math.random()-.5)*.008}; };
@@ -711,6 +795,7 @@ function openRecordModal() {
     inp.addEventListener('keydown',e=>e.key==='Enter'&&addTag());
     const addBtn=el('button',{class:'btn-add',onclick:addTag},'+');
     const wrap=el('div',{class:'tags-wrap'});
+    const suggEl=el('div',{style:'font-size:11px;color:var(--ink-light);min-height:15px;'});
     function addTag(){
       const t=inp.value.trim().toLowerCase().replace(/\s+/g,'-');
       if(t&&!tags.includes(t)){tags.push(t);renderTags();}
@@ -720,17 +805,30 @@ function openRecordModal() {
       wrap.innerHTML='';
       tags.forEach(t=>{
         const c=tagColor(t);
-        const chip=el('span',{class:'tag-chip',onclick:()=>{tags=tags.filter(x=>x!==t);renderTags();}},`${t} ×`);
+        const label=autoTagged.has(t)?`✦ ${t} ×`:`${t} ×`;
+        const chip=el('span',{class:'tag-chip',title:autoTagged.has(t)?'auto-detected — click to remove':'click to remove',onclick:()=>{tags=tags.filter(x=>x!==t);autoTagged.delete(t);renderTags();}},label);
         chip.style.background=c.bg; chip.style.color=c.fg;
         wrap.appendChild(chip);
       });
     }
-    body.appendChild(el('div',{class:'rec-review'},aud,el('div',{class:'tag-row'},inp,addBtn),wrap,
+    renderTags();
+    body.appendChild(el('div',{class:'rec-review'},aud,el('div',{class:'tag-row'},inp,addBtn),wrap,suggEl,
       el('div',{class:'review-actions'},
-        el('button',{class:'btn btn-ghost',onclick:()=>{audioUrl=null;audioBlob=null;tags=[];renderIdle();}},'re-record'),
+        el('button',{class:'btn btn-ghost',onclick:()=>{audioUrl=null;audioBlob=null;tags=[];autoTagged.clear();autoRan=false;renderIdle();}},'re-record'),
         el('button',{class:'btn btn-primary',onclick:submit},'submit ♪')
       )
     ));
+    if(!autoRan){
+      autoRan=true;
+      suggEl.innerHTML='<span class="spinner-sm"></span>listening for tags…';
+      suggestTags(audioBlob).then(sug=>{
+        sug.forEach(t=>{if(!tags.includes(t)){tags.push(t);autoTagged.add(t);}});
+        renderTags();
+        suggEl.textContent=sug.length
+          ? '✦ auto-detected — tap any tag to remove, or add your own'
+          : 'no confident guess — add tags manually';
+      }).catch(e=>{console.warn('auto-tag unavailable:',e);suggEl.textContent='';});
+    }
   }
   function renderUploading(){body.innerHTML='';body.appendChild(el('div',{class:'spinner-wrap'},el('div',{class:'spinner'}),el('span',{},'pinning to the map…')));}
 
@@ -765,181 +863,6 @@ function openRecordModal() {
 }
 
 /* ── Music generator panel ── */
-/* ── Waveform skyline: the city as one continuous audio signal ── */
-document.getElementById('btn-sky').addEventListener('click', openSkyline);
-let skyClose = null;
-
-async function openSkyline() {
-  if (skyClose) { skyClose(); return; }
-
-  const overlay = el('div', { class: 'skyline-overlay' });
-  const head = el('div', { class: 'sky-head' },
-    el('div', {},
-      el('h3', {}, 'the city, west to east'),
-      el('p', {}, 'every recording drawn as its actual waveform, placed at its longitude — click a burst to listen')),
-    el('button', { class: 'sky-close', onclick: () => skyClose && skyClose() }, '×')
-  );
-  const wrap = el('div', { class: 'sky-canvas-wrap' });
-  const canvas = el('canvas', { class: 'sky-canvas' });
-  const tip = el('div', { class: 'sky-tip' });
-  const status = el('div', { class: 'sky-status' }, 'decoding the city…');
-  wrap.append(canvas, tip, status);
-  overlay.append(head, wrap);
-  document.body.appendChild(overlay);
-
-  let player = null, raf = null, segments = [], playingIdx = -1;
-  skyClose = () => {
-    if (player) { player.pause(); player = null; }
-    if (raf) cancelAnimationFrame(raf);
-    window.removeEventListener('resize', draw);
-    overlay.remove(); skyClose = null;
-  };
-
-  // fetch + decode every recording
-  let clips = [];
-  try {
-    const recs = await fetch(`${API}/api/recordings`).then(r => r.json());
-    if (!recs.length) { status.textContent = 'no recordings yet'; return; }
-    const AC = new (window.AudioContext || window.webkitAudioContext)();
-    clips = (await Promise.all(recs.slice(0, 24).map(async rec => {
-      try {
-        const ab = await fetch(`${API}/uploads/${rec.filename}`).then(r => r.arrayBuffer());
-        const buf = await AC.decodeAudioData(ab);
-        return { rec, buf };
-      } catch { return null; }
-    }))).filter(Boolean);
-    await AC.close();
-  } catch { status.textContent = 'could not load recordings'; return; }
-  if (!clips.length) { status.textContent = 'could not decode recordings'; return; }
-  status.remove();
-
-  clips.sort((a, b) => a.rec.lng - b.rec.lng);
-  const lngs = clips.map(c => c.rec.lng);
-  const minLng = Math.min(...lngs), maxLng = Math.max(...lngs), span = maxLng - minLng || 1;
-
-  function layout(W) {
-    const padL = 50, padR = 50, gap = 22;
-    const n = clips.length;
-    // guarantee everything fits with visible flat line between bursts
-    const segW = Math.max(28, Math.min(110, (W - padL - padR - gap * (n - 1)) / n));
-    segments = clips.map(c => ({
-      c, w: segW,
-      x: padL + ((c.rec.lng - minLng) / span) * (W - padL - padR - segW),
-    }));
-    // forward pass: enforce minimum gap left→right
-    for (let i = 1; i < n; i++) {
-      const prev = segments[i - 1];
-      if (segments[i].x < prev.x + prev.w + gap) segments[i].x = prev.x + prev.w + gap;
-    }
-    // backward pass: clamp to right edge, push earlier segments left if needed
-    segments[n - 1].x = Math.min(segments[n - 1].x, W - padR - segW);
-    for (let i = n - 2; i >= 0; i--) {
-      const next = segments[i + 1];
-      if (segments[i].x + segW + gap > next.x) segments[i].x = next.x - gap - segW;
-    }
-  }
-
-  function draw(highlightIdx = -1, playX = null) {
-    const W = wrap.clientWidth, H = wrap.clientHeight, dpr = devicePixelRatio || 1;
-    canvas.width = W * dpr; canvas.height = H * dpr;
-    const ctx = canvas.getContext('2d');
-    ctx.scale(dpr, dpr);
-    ctx.clearRect(0, 0, W, H);
-    layout(W);
-
-    const base = H * 0.5, amp = H * 0.3;
-    ctx.lineWidth = 1.3; ctx.lineJoin = 'round'; ctx.strokeStyle = '#111';
-    ctx.beginPath();
-    ctx.moveTo(0, base);
-    for (let si = 0; si < segments.length; si++) {
-      const { c, x, w } = segments[si];
-      ctx.lineTo(x, base);
-      const raw = c.buf.getChannelData(0);
-      let peak = 0; for (let i = 0; i < raw.length; i += 50) peak = Math.max(peak, Math.abs(raw[i]));
-      const norm = peak ? 0.95 / peak : 1;
-      const pts = Math.floor(w * 2);
-      for (let i = 0; i < pts; i++) {
-        const v = raw[Math.floor(i * raw.length / pts)] * norm;
-        ctx.lineTo(x + (i / pts) * w, base - v * amp * (si === highlightIdx ? 1 : 0.85));
-      }
-      ctx.lineTo(x + w, base);
-    }
-    ctx.lineTo(W, base);
-    ctx.stroke();
-
-    // labels + highlight underline
-    ctx.textAlign = 'center';
-    for (let si = 0; si < segments.length; si++) {
-      const { c, x, w } = segments[si];
-      const hi = si === highlightIdx || si === playingIdx;
-      const ly = base + amp + (si % 2 ? 44 : 26); // stagger rows so labels never collide
-      ctx.fillStyle = hi ? '#111' : '#9a9a9a';
-      ctx.font = `${hi ? '700 ' : ''}10px Inter, sans-serif`;
-      ctx.fillText(((c.rec.tags && c.rec.tags[0]) || 'sound').toUpperCase(), x + w / 2, ly);
-      if (hi) {
-        ctx.strokeStyle = '#111'; ctx.lineWidth = 1;
-        ctx.beginPath(); ctx.moveTo(x, ly + 7); ctx.lineTo(x + w, ly + 7); ctx.stroke();
-        ctx.lineWidth = 1.3;
-      }
-    }
-    // west/east markers
-    ctx.fillStyle = '#c2c2c2'; ctx.font = '10px Inter, sans-serif';
-    ctx.textAlign = 'left';  ctx.fillText('W ◀', 18, base - amp - 14);
-    ctx.textAlign = 'right'; ctx.fillText('▶ E', W - 18, base - amp - 14);
-
-    // playhead
-    if (playX !== null) {
-      ctx.strokeStyle = '#111'; ctx.lineWidth = 1;
-      ctx.setLineDash([3, 3]);
-      ctx.beginPath(); ctx.moveTo(playX, base - amp - 4); ctx.lineTo(playX, base + amp + 8); ctx.stroke();
-      ctx.setLineDash([]);
-    }
-  }
-
-  function segAt(mx) {
-    return segments.findIndex(s => mx >= s.x - 4 && mx <= s.x + s.w + 4);
-  }
-
-  canvas.addEventListener('mousemove', e => {
-    const r = canvas.getBoundingClientRect();
-    const idx = segAt(e.clientX - r.left);
-    canvas.style.cursor = idx >= 0 ? 'pointer' : 'default';
-    if (idx >= 0) {
-      const { c, x, w } = segments[idx];
-      tip.textContent = `${(c.rec.tags || []).join(' · ')} — ${new Date(c.rec.timestamp).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`;
-      tip.style.left = (x + w / 2) + 'px';
-      tip.style.top = (wrap.clientHeight * 0.5 - wrap.clientHeight * 0.3 - 8) + 'px';
-      tip.style.opacity = 1;
-    } else tip.style.opacity = 0;
-    if (playingIdx < 0) draw(idx);
-  });
-  canvas.addEventListener('mouseleave', () => { tip.style.opacity = 0; if (playingIdx < 0) draw(); });
-
-  canvas.addEventListener('click', e => {
-    const r = canvas.getBoundingClientRect();
-    const idx = segAt(e.clientX - r.left);
-    if (idx < 0) return;
-    if (player) { player.pause(); player = null; }
-    if (raf) cancelAnimationFrame(raf);
-    playingIdx = idx;
-    const seg = segments[idx];
-    player = new Audio(`${API}/uploads/${seg.c.rec.filename}`);
-    player.play();
-    const step = () => {
-      if (!player || player.ended || player.paused) { playingIdx = -1; draw(); return; }
-      draw(idx, seg.x + (player.currentTime / (player.duration || 1)) * seg.w);
-      raf = requestAnimationFrame(step);
-    };
-    raf = requestAnimationFrame(step);
-  });
-
-  window.addEventListener('resize', () => draw());
-  draw();
-}
-
-document.getElementById('btn-gen').addEventListener('click', openMusicPanel);
-let musicUnmount = null;
-
 /* ── Pitch detection & scale helpers ── */
 const MUSIC_SCALES = {
   major:      { intervals:[0,2,4,5,7,9,11], label:'major' },
@@ -1001,284 +924,801 @@ function midiToName(midi) {
   return NOTE_NAMES[((midi % 12) + 12) % 12] + (Math.floor(midi / 12) - 1);
 }
 
-function openMusicPanel() {
-  if (musicUnmount) { musicUnmount(); musicUnmount=null; }
-  if (timelineUnmount) { timelineUnmount(); timelineUnmount=null; if(activeHighlight){activeHighlight.remove();activeHighlight=null;} }
+/* ── Generate studio ─────────────────────────────────────────────────────
+   One combined view: the archive drawn in polar time —
+     angle  = hour the sound was captured
+     radius = distance from the heart of the city (Times Square)
+   A timeframe bar filters the archive; clicking a distance ring selects
+   that band of the city; the selection unrolls below as a west→east
+   waveform strip (the skyline); generate renders a house track from it. */
+document.getElementById('btn-gen').addEventListener('click', openStudio);
+let studioClose = null;
+let studioAnchor = { lat: 40.758, lng: -73.9855 }; // re-set from the map on open, movable via the inset
+const studioCache = new Map(); // filename → { buf, onsets, freq }
 
-  const panel=el('div',{class:'panel'});
-  const head=el('div',{class:'panel-head'},
-    el('div',{},el('h3',{},'city house'),el('p',{},'a house track built from real recordings')),
-    el('button',{class:'panel-close',onclick:()=>{musicUnmount();musicUnmount=null;}},'×')
-  );
-  const body=el('div',{class:'gen-body'});
-  panel.append(head,body);
-
-  let currentTf='24h';
-  const tfBar=el('div',{class:'tf-bar',style:'padding:0;border:none;'});
-  for(const [v,l] of [['1h','Last hour'],['24h','Last 24h'],['7d','Last 7 days'],['30d','Last 30 days'],['all','All time']]){
-    tfBar.appendChild(el('button',{class:`tf-btn${v==='24h'?' active':''}`,onclick(e){tfBar.querySelectorAll('.tf-btn').forEach(x=>x.classList.remove('active'));e.currentTarget.classList.add('active');currentTf=v;}},l));
-  }
-
-  const howEl=el('p',{},'Builds a house track (118–126 BPM) from the recordings themselves. A four-on-the-floor kick, offbeat hats and claps set the groove; one clip becomes a low-pass filtered atmosphere that pumps with the kick, while the others are chopped into short slices and triggered on the beat grid — panned by where they were recorded. A synth bassline follows the pitch detected in the clips. Tempo, swing, patterns and the featured atmosphere are dealt fresh from the clip set every run — change the timeframe or just press again for a new take.');
-  const statusEl=el('div',{class:'gen-status'});
-  const genBtn=el('button',{class:'btn-generate',onclick:generate},'▶ generate house track');
-  const resultWrap=el('div',{});
-
-  body.append(el('div',{},el('label',{},'timeframe'),tfBar),el('div',{},el('label',{},'how it works'),howEl),statusEl,genBtn,resultWrap);
-  musicUnmount=mount(panel);
-
-  async function generate(){
-    genBtn.disabled=true; resultWrap.innerHTML=''; setStatus('fetching recordings…');
-    try{
-      const p=new URLSearchParams({south:'40.4774',north:'40.9176',west:'-74.2591',east:'-73.7004'});
-      if(currentTf!=='all') p.append('since',sinceDate(currentTf));
-      const recs=await fetch(`${API}/api/recordings?${p}`).then(r=>r.json());
-      if(!recs.length){setStatus('no recordings yet — add some sounds first!');genBtn.disabled=false;return;}
-
-      const sample=recs.slice(0,10);
-      setStatus(`loading & analyzing ${sample.length} clips…`);
-
-      const AC=new (window.AudioContext||window.webkitAudioContext)();
-      const clips=(await Promise.all(sample.map(async rec=>{
-        try{
-          const ab=await fetch(`${API}/uploads/${rec.filename}`).then(r=>r.arrayBuffer());
-          const buf=await AC.decodeAudioData(ab);
-          const raw=buf.getChannelData(0), sr=buf.sampleRate;
-          // onset candidates: top-energy 0.3s windows, spaced ≥0.5s apart
-          const win=Math.floor(sr*0.3), hop=Math.floor(sr*0.1);
-          const cands=[];
-          for(let i=0;i<raw.length-win;i+=hop){
-            let e=0; for(let j=0;j<win;j+=8) e+=raw[i+j]**2;
-            cands.push({off:i,e});
-          }
-          cands.sort((a,b)=>b.e-a.e);
-          const onsets=[];
-          for(const c of cands){
-            if(onsets.every(o=>Math.abs(o-c.off)>sr*0.5)) onsets.push(c.off);
-            if(onsets.length>=4) break;
-          }
-          // pitch of loudest window → for the bassline root
-          const seg=raw.slice(cands[0].off,cands[0].off+4096);
-          const freq=detectPitch(seg,sr);
-          return {rec,buf,onsets:onsets.length?onsets:[0],freq};
-        }catch{return null;}
-      }))).filter(Boolean);
-      await AC.close();
-      if(!clips.length){setStatus('could not decode any recordings');genBtn.disabled=false;return;}
-
-      // ── seeded rng: which clips are in the set AND which run this is both matter,
-      //    so a different timeframe (or another press of the button) gives a new groove ──
-      let seed=2166136261;
-      const mix=str=>{for(let i=0;i<str.length;i++){seed^=str.charCodeAt(i);seed=Math.imul(seed,16777619)>>>0;}};
-      clips.forEach(c=>mix(c.rec.id||c.rec.filename));
-      mix(currentTf); mix(String(Date.now()>>>10));
-      const rand=()=>{seed=(Math.imul(seed,1103515245)+12345)>>>0;return (seed>>>8)/0x1000000;};
-      const pick=arr=>arr[Math.floor(rand()*arr.length)];
-
-      // ── seeded musical personality ──
-      const BPM=118+Math.floor(rand()*5)*2;             // 118–126
-      const BEAT=60/BPM, BARS=16, TOTAL=BARS*4*BEAT+2;
-      const SWING=rand()*0.1;                           // offbeat push, 0–10% of a beat
-      const SIXTEENTHS=rand()<0.6;                      // hat sprinkle on/off
-      const ATMO_LP=500+rand()*900;                     // atmosphere darkness
-      const DUCK=0.08+rand()*0.14;                      // sidechain depth
-      const CHOP_DENSITY=rand();                        // sparse ↔ busy chops
-      setStatus(`sequencing ${BPM} BPM…`);
-
-      const SR=44100;
-      const off=new OfflineAudioContext(2,Math.ceil(SR*TOTAL),SR);
-      const t0=0.05;
-      const beatAt=(bar,beat)=>t0+(bar*4+beat)*BEAT;
-
-      // ── master chain: compressor → fade gain → destination ──
-      const comp=off.createDynamicsCompressor();
-      comp.threshold.value=-14; comp.ratio.value=4; comp.attack.value=0.004; comp.release.value=0.18;
-      const master=off.createGain();
-      master.gain.setValueAtTime(0,0);
-      master.gain.linearRampToValueAtTime(0.9,1.2);
-      master.gain.setValueAtTime(0.9,TOTAL-2.2);
-      master.gain.linearRampToValueAtTime(0,TOTAL-0.1);
-      comp.connect(master); master.connect(off.destination);
-
-      // bar roles: intro 0-1, build 2-3, main 4-13, outro 14-15
-      const hasKick=b=>b>=2&&b<15, hasBass=b=>b>=4&&b<14, hasClap=b=>b>=4&&b<14, hasChops=b=>b>=2;
-
-      // ── drums ──
-      const drumBus=off.createGain(); drumBus.gain.value=1; drumBus.connect(comp);
-      function kick(t){
-        const o=off.createOscillator(), g=off.createGain();
-        o.frequency.setValueAtTime(150,t);
-        o.frequency.exponentialRampToValueAtTime(45,t+0.12);
-        g.gain.setValueAtTime(1.0,t);
-        g.gain.exponentialRampToValueAtTime(0.001,t+0.28);
-        o.connect(g); g.connect(drumBus); o.start(t); o.stop(t+0.3);
-        // click transient
-        const n=off.createBufferSource(), nb=off.createBuffer(1,220,SR);
-        const d=nb.getChannelData(0); for(let i=0;i<220;i++)d[i]=(Math.random()*2-1)*(1-i/220);
-        n.buffer=nb;
-        const ng=off.createGain(); ng.gain.value=0.25;
-        n.connect(ng); ng.connect(drumBus); n.start(t);
-      }
-      const noiseBuf=off.createBuffer(1,SR,SR);
-      { const d=noiseBuf.getChannelData(0); for(let i=0;i<SR;i++)d[i]=Math.random()*2-1; }
-      function hat(t,open){
-        const s=off.createBufferSource(); s.buffer=noiseBuf;
-        const hp=off.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=8200;
-        const g=off.createGain();
-        const dur=open?0.14:0.045;
-        g.gain.setValueAtTime(open?0.32:0.25,t);
-        g.gain.exponentialRampToValueAtTime(0.001,t+dur);
-        s.connect(hp); hp.connect(g); g.connect(drumBus);
-        s.start(t,rand()*0.4); s.stop(t+dur+0.02);
-      }
-      function clap(t){
-        for(const dt of [0,0.012,0.026]){
-          const s=off.createBufferSource(); s.buffer=noiseBuf;
-          const bp=off.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=1800; bp.Q.value=1.1;
-          const g=off.createGain();
-          g.gain.setValueAtTime(dt===0.026?0.5:0.28,t+dt);
-          g.gain.exponentialRampToValueAtTime(0.001,t+dt+0.12);
-          s.connect(bp); bp.connect(g); g.connect(drumBus);
-          s.start(t+dt,rand()*0.4); s.stop(t+dt+0.15);
-        }
-      }
-      const openHatEvery=pick([2,4,4,8]); // how often the open-hat turnaround lands
-      for(let bar=0;bar<BARS;bar++){
-        for(let b=0;b<4;b++){
-          const t=beatAt(bar,b);
-          if(hasKick(bar)) kick(t);
-          hat(t+BEAT*(0.5+SWING),false);             // classic offbeat hat, swung
-          if(SIXTEENTHS&&bar>=6&&bar<14&&b%2===1) hat(t+BEAT*0.25,false);
-          if(hasClap(bar)&&(b===1||b===3)) clap(t);
-          if(bar>=4&&bar<14&&b===3&&bar%openHatEvery===openHatEvery-1) hat(t+BEAT*(0.5+SWING),true);
-        }
-      }
-
-      // ── bassline: root from detected pitch, offbeat eighths ──
-      const pitched=clips.find(c=>c.freq&&c.freq>60&&c.freq<2000);
-      let rootMidi=pitched?freqToMidi(pitched.freq):45;
-      while(rootMidi>45)rootMidi-=12; while(rootMidi<33)rootMidi+=12;
-      const bassBus=off.createGain(); bassBus.gain.value=0.55; bassBus.connect(comp);
-      const bassPattern=pick([                 // minor-flavored 2-bar patterns
-        [0,0,7,0, 0,10,7,3],
-        [0,3,0,7, 0,3,10,7],
-        [0,0,0,5, 0,0,3,7],
-        [0,7,3,7, 0,7,5,10],
-        [0,0,12,0, 0,10,0,7],
-      ]);
-      function bassNote(t,midi,dur){
-        const o=off.createOscillator(); o.type='sawtooth';
-        o.frequency.value=440*Math.pow(2,(midi-69)/12);
-        const lp=off.createBiquadFilter(); lp.type='lowpass'; lp.Q.value=6;
-        lp.frequency.setValueAtTime(900,t);
-        lp.frequency.exponentialRampToValueAtTime(220,t+dur);
-        const g=off.createGain();
-        g.gain.setValueAtTime(0,t); g.gain.linearRampToValueAtTime(0.5,t+0.012);
-        g.gain.setValueAtTime(0.5,t+dur-0.04); g.gain.linearRampToValueAtTime(0,t+dur);
-        o.connect(lp); lp.connect(g); g.connect(bassBus);
-        o.start(t); o.stop(t+dur+0.02);
-      }
-      for(let bar=0;bar<BARS;bar++){
-        if(!hasBass(bar)) continue;
-        for(let b=0;b<4;b++){
-          const iv=bassPattern[((bar%2)*4+b)];
-          bassNote(beatAt(bar,b)+BEAT*(0.5+SWING),rootMidi+iv,BEAT*0.42); // offbeat house bass, swung
-        }
-      }
-
-      // ── atmosphere: longest clip, low-passed loop, sidechain-pumped ──
-      const lngs=clips.map(c=>c.rec.lng);
-      const minLng=Math.min(...lngs),maxLng=Math.max(...lngs),lngSpan=maxLng-minLng||1;
-      // atmosphere: seeded pick among the longer clips, so different sets/runs feature different beds
-      const longIdxs=clips.map((c,i)=>i).filter(i=>clips[i].buf.duration>=5);
-      const atmoIdx=longIdxs.length?pick(longIdxs):clips.reduce((mi,c,i)=>c.buf.duration>clips[mi].buf.duration?i:mi,0);
-      {
-        const c=clips[atmoIdx];
-        const s=off.createBufferSource(); s.buffer=c.buf; s.loop=true;
-        const lp=off.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=ATMO_LP;
-        const duck=off.createGain();
-        // sidechain pump: duck hard on every beat, swell back before the next
-        for(let bar=0;bar<BARS;bar++)for(let b=0;b<4;b++){
-          const t=beatAt(bar,b);
-          duck.gain.setValueAtTime(hasKick(bar)?DUCK:0.3,t);
-          duck.gain.linearRampToValueAtTime(0.34,t+BEAT*0.72);
-        }
-        const g=off.createGain(); g.gain.value=1;
-        s.connect(lp); lp.connect(duck); duck.connect(g); g.connect(comp);
-        s.start(t0);
-      }
-
-      // ── clip chops on the beat grid ──
-      const chopBus=off.createGain(); chopBus.gain.value=0.9; chopBus.connect(comp);
-      // shuffled order so a different clip fronts each bar across runs
-      const chopClips=clips.filter((_,i)=>i!==atmoIdx)
-        .map(c=>({c,k:rand()})).sort((a,b)=>a.k-b.k).map(x=>x.c);
-      const chopCount=new Array(clips.length).fill(0);
-      // step-pattern pool (in beats); density decides sparse vs busy bars
-      const patternPool=[
-        [1,2.5],[0.5,2,3.5],[1.5,3],[0.75,2.25,3.5],
-        [2],[0.5,1.5,2.5,3.5],[1,1.75,3],[0.25,2,2.75],
-      ];
-      const patterns=[];
-      for(let k=0;k<4;k++){
-        const p=pick(patternPool);
-        patterns.push(CHOP_DENSITY<0.35?p.slice(0,Math.max(1,p.length-1)):p);
-      }
-      for(let bar=0;bar<BARS;bar++){
-        if(!hasChops(bar)||!chopClips.length) continue;
-        const clip=chopClips[bar%chopClips.length];
-        const i=clips.indexOf(clip);
-        const pat=patterns[bar%patterns.length];
-        for(const stepBeat of pat){
-          const t=beatAt(bar,stepBeat+(stepBeat%1!==0?SWING:0));
-          const onset=clip.onsets[Math.floor(rand()*clip.onsets.length)];
-          const dur=BEAT*(rand()<0.3?0.9:0.45);
-          const s=off.createBufferSource(); s.buffer=clip.buf;
-          const pan=off.createStereoPanner();
-          pan.pan.value=Math.max(-0.85,Math.min(0.85,((clip.rec.lng-minLng)/lngSpan)*2-1));
-          const g=off.createGain();
-          g.gain.setValueAtTime(0,t);
-          g.gain.linearRampToValueAtTime(0.85,t+0.015);
-          g.gain.setValueAtTime(0.85,t+dur-0.05);
-          g.gain.linearRampToValueAtTime(0,t+dur);
-          s.connect(g); g.connect(pan); pan.connect(chopBus);
-          s.start(t,onset/clip.buf.sampleRate,dur+0.05);
-          chopCount[i]++;
-        }
-      }
-
-      setStatus('rendering…');
-      const rendered=await off.startRendering();
-      const wav=encodeWav(rendered);
-      const url=URL.createObjectURL(new Blob([wav],{type:'audio/wav'}));
-
-      setStatus('');
-      resultWrap.innerHTML='';
-      resultWrap.appendChild(el('div',{style:'font-size:11px;color:var(--ink-light);letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;'},
-        `${BPM} bpm · ${BARS} bars · ${clips.length} recordings`));
-
-      const vizRow=el('div',{style:'display:flex;flex-wrap:wrap;gap:5px;margin-bottom:14px;'});
-      clips.forEach((c,i)=>{
-        const role=i===atmoIdx?'atmosphere':`${chopCount[i]} chops`;
-        const pan=((c.rec.lng-minLng)/lngSpan)*2-1;
-        const panLbl=pan<-0.3?'◀ L':pan>0.3?'R ▶':'· C ·';
-        vizRow.appendChild(el('div',{style:'display:flex;flex-direction:column;align-items:center;gap:1px;background:var(--cream);border:1px solid var(--border-med);border-radius:8px;padding:5px 9px;'},
-          el('span',{style:'font-family:Space Grotesk,Inter,sans-serif;font-size:12px;font-weight:700;color:var(--ink);line-height:1.2;'},(c.rec.tags&&c.rec.tags[0])||'sound'),
-          el('span',{style:'font-size:9px;color:var(--ink-light);'},role),
-          el('span',{style:'font-size:9px;color:var(--ink-light);'},panLbl)
-        ));
-      });
-      resultWrap.appendChild(vizRow);
-      resultWrap.appendChild(el('div',{class:'gen-result'},
-        el('h4',{},`✓ house track from ${clips.length} city sounds`),
-        el('audio',{controls:'',src:url}),
-        el('a',{class:'btn-dl',href:url,download:'city-house.wav'},'↓ download wav')
-      ));
-    }catch(e){console.error(e);setStatus(`error: ${e.message}`);}
-    genBtn.disabled=false;
-  }
-  function setStatus(s){statusEl.innerHTML=s?`<span class="spinner-sm"></span>${s}`:'';}
+function distKm(lat, lng) {
+  const R = 6371, toR = Math.PI / 180;
+  const dLat = (lat - studioAnchor.lat) * toR, dLng = (lng - studioAnchor.lng) * toR;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat*toR) * Math.cos(studioAnchor.lat*toR) * Math.sin(dLng/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(a));
 }
+
+function promptFor(rec) {
+  const t = (rec.tags || []).join(' ');
+  const hr = new Date(rec.timestamp).getHours();
+  if (/birds|pigeon/.test(t)) return 'the birds start before the traffic does — when did you last hear the first one?';
+  if (/rain|thunder/.test(t)) return 'rain sounds different on every street — where does it land near you?';
+  if (/children|play/.test(t)) return 'a playground is the loudest kind of joy — walk past one without headphones.';
+  if (/siren/.test(t))        return 'a siren passes through every life in this city — notice where yours crosses it.';
+  if (/subway/.test(t))       return 'the city hums underneath — next platform, listen before the train arrives.';
+  if (/bells|chimes/.test(t)) return 'somewhere a bell still marks the hour — can you hear one from your block?';
+  if (/dog|cat/.test(t))      return 'every block has a voice that isn\'t human — who speaks on yours?';
+  if (/water|fountain/.test(t)) return 'find the nearest fountain and stay for one full minute.';
+  if (/crickets|insects/.test(t)) return 'even here, the night still sings — step out after dark and count the layers.';
+  if (/music|organ|singing/.test(t)) return 'someone is always playing somewhere — follow the next music you hear.';
+  if (hr < 6)  return `this was ${hr}am — the city before dawn is a different animal. hear it once.`;
+  if (hr < 12) return 'morning has a sound signature — step outside and learn your block\'s.';
+  if (hr < 18) return 'the afternoon din hides small sounds — stop for thirty seconds and count them.';
+  return 'evening softens the city — take the long way home and listen.';
+}
+
+function analyzeBuffer(buf) {
+  const raw = buf.getChannelData(0), sr = buf.sampleRate;
+  const win = Math.floor(sr * 0.3), hop = Math.floor(sr * 0.1);
+  const cands = [];
+  for (let i = 0; i < raw.length - win; i += hop) {
+    let e = 0; for (let j = 0; j < win; j += 8) e += raw[i + j] ** 2;
+    cands.push({ off: i, e });
+  }
+  cands.sort((a, b) => b.e - a.e);
+  const onsets = [];
+  for (const c of cands) {
+    if (onsets.every(o => Math.abs(o - c.off) > sr * 0.5)) onsets.push(c.off);
+    if (onsets.length >= 4) break;
+  }
+  const top = cands[0] ? cands[0].off : 0;
+  const freq = detectPitch(raw.slice(top, top + 4096), sr);
+  return { onsets: onsets.length ? onsets : [0], freq };
+}
+
+/* the house engine — takes analyzed clips [{rec,buf,onsets,freq}], returns a wav url */
+// each genre re-tunes the same primitives (kick/hat/clap/bass/atmosphere/chops)
+// bpm ranges are wide on purpose: the actual tempo is estimated from the audio
+const GENRES = {
+  house:   { label: 'house',   bpm: [116, 128, 1], bars: 16, kick: 'four',    hat: 'offbeat', clap: true,  bass: 'offbeat', atmoLP: [500, 1400], duck: 0.14, reverb: 0,    crackle: false },
+  techno:  { label: 'techno',  bpm: [126, 140, 1], bars: 16, kick: 'four',    hat: 'driving', clap: false, bass: 'rolling', atmoLP: [300, 650],  duck: 0.10, reverb: 0.1,  crackle: false, dark: true },
+  lofi:    { label: 'lo-fi',   bpm: [68, 92, 1],   bars: 12, kick: 'boombap', hat: 'lazy',    clap: 'rim', bass: 'root',    atmoLP: [700, 1300], duck: 0.3,  reverb: 0.22, crackle: true,  swingBoost: 0.16 },
+  ambient: { label: 'ambient', bpm: [54, 76, 1],   bars: 8,  kick: 'none',    hat: 'none',    clap: false, bass: 'drone',   atmoLP: [350, 800],  duck: 0.6,  reverb: 0.42, crackle: false, float: true },
+};
+
+// energy weight per tag → drives density, brightness, swing of the arrangement
+const TAG_ENERGY = {
+  siren: 1, traffic: 0.9, subway: 0.85, construction: 1, machinery: 0.95, crowd: 0.72,
+  market: 0.7, skateboard: 0.75, helicopter: 0.9, aircraft: 0.85, thunder: 0.8, dog: 0.6,
+  music: 0.62, singing: 0.55, live: 0.7, drums: 0.85, voices: 0.5, children: 0.6, laugh: 0.6, busy: 0.75,
+  birds: 0.22, pigeon: 0.28, nature: 0.2, park: 0.24, water: 0.2, fountain: 0.22, rain: 0.32,
+  chimes: 0.22, bells: 0.3, wind: 0.2, crickets: 0.15, insects: 0.2, cat: 0.32, organ: 0.35, night: 0.2, morning: 0.3,
+};
+
+function tagMood(clips) {
+  let e = 0, cnt = 0;
+  for (const c of clips) for (const t of (c.rec.tags || [])) {
+    const w = TAG_ENERGY[String(t).toLowerCase()];
+    if (w != null) { e += w; cnt++; }
+  }
+  const energy = cnt ? e / cnt : 0.5;
+  const scale = getScaleForTags(clips.flatMap(c => c.rec.tags || []));
+  return { energy, scale, label: energy > 0.64 ? 'restless' : energy < 0.4 ? 'calm' : 'steady' };
+}
+
+// estimate tempo from an onset envelope, folded into [lo,hi]
+function estimateBPM(buf, lo, hi) {
+  const sr = buf.sampleRate, raw = buf.getChannelData(0);
+  const hop = Math.max(1, Math.floor(sr / 100)), n = Math.floor(raw.length / hop);
+  if (n < 40) return null;
+  const env = new Float32Array(n);
+  for (let i = 0; i < n; i++) { let s = 0; for (let j = 0; j < hop; j += 4) { const x = raw[i * hop + j]; s += x * x; } env[i] = Math.sqrt(s); }
+  const on = new Float32Array(n);
+  for (let i = 1; i < n; i++) { const d = env[i] - env[i - 1]; on[i] = d > 0 ? d : 0; }
+  const fps = 100, lagLo = Math.floor(fps * 60 / (hi * 2)), lagHi = Math.ceil(fps * 60 / (lo / 2));
+  let bestLag = -1, best = 0;
+  for (let lag = lagLo; lag <= lagHi; lag++) {
+    let s = 0; for (let i = lag; i < n; i++) s += on[i] * on[i - lag];
+    if (s > best) { best = s; bestLag = lag; }
+  }
+  if (bestLag <= 0) return null;
+  let bpm = fps * 60 / bestLag;
+  while (bpm < lo) bpm *= 2; while (bpm > hi) bpm /= 2;
+  return (bpm >= lo && bpm <= hi) ? bpm : null;
+}
+
+async function generateTrack(clips, seedExtra, genreKey, setStatus) {
+  const cfg = GENRES[genreKey] || GENRES.house;
+  let seed = 2166136261;
+  const mix = str => { for (let i = 0; i < str.length; i++) { seed ^= str.charCodeAt(i); seed = Math.imul(seed, 16777619) >>> 0; } };
+  clips.forEach(c => mix(c.rec.id || c.rec.filename));
+  mix(String(seedExtra)); mix(genreKey); mix(String(Date.now() >>> 10));
+  const rand = () => { seed = (Math.imul(seed, 1103515245) + 12345) >>> 0; return (seed >>> 8) / 0x1000000; };
+  const pick = arr => arr[Math.floor(rand() * arr.length)];
+
+  const mood = tagMood(clips);
+  const [bMin, bMax] = cfg.bpm;
+  // tempo comes from the actual audio: estimate from a seeded pick among the longer clips
+  const tempoPool = clips.slice().sort((a, b) => b.buf.duration - a.buf.duration).slice(0, Math.max(1, Math.ceil(clips.length / 2)));
+  let BPM = estimateBPM(pick(tempoPool).buf, bMin, bMax);
+  if (BPM == null) BPM = bMin + rand() * (bMax - bMin);
+  // blend estimate with a mood bias, then add seeded jitter so it doesn't cluster
+  BPM = BPM * 0.6 + (bMin + mood.energy * (bMax - bMin)) * 0.4 + (rand() - 0.5) * (bMax - bMin) * 0.4;
+  BPM = Math.round(Math.max(bMin, Math.min(bMax, BPM)));
+  const BEAT = 60 / BPM, BARS = cfg.bars, TOTAL = BARS * 4 * BEAT + 2;
+  const SWING = rand() * 0.08 + (cfg.swingBoost || 0) + (mood.energy < 0.4 ? 0.04 : 0);
+  const SIXTEENTHS = rand() < (0.25 + mood.energy * 0.55);
+  const ATMO_LP = cfg.atmoLP[0] + rand() * (cfg.atmoLP[1] - cfg.atmoLP[0]);
+  const DUCK = cfg.duck;
+  const CHOP_DENSITY = Math.max(0, Math.min(1, mood.energy * 0.7 + rand() * 0.5 - 0.1));
+  const kickStart = cfg.float ? 0 : pick([1, 2, 2, 3]); // vary how the track opens
+  setStatus(`sequencing ${cfg.label} · ${BPM} bpm · ${mood.label}…`);
+
+  const SR = 44100;
+  const off = new OfflineAudioContext(2, Math.ceil(SR * TOTAL), SR);
+  const t0 = 0.05;
+  const beatAt = (bar, beat) => t0 + (bar * 4 + beat) * BEAT;
+
+  const comp = off.createDynamicsCompressor();
+  comp.threshold.value = -14; comp.ratio.value = 4; comp.attack.value = 0.004; comp.release.value = 0.18;
+  const master = off.createGain();
+  master.gain.setValueAtTime(0, 0);
+  master.gain.linearRampToValueAtTime(0.9, 1.2);
+  master.gain.setValueAtTime(0.9, TOTAL - 2.2);
+  master.gain.linearRampToValueAtTime(0, TOTAL - 0.1);
+  comp.connect(master); master.connect(off.destination);
+
+  // optional reverb send (lo-fi / ambient / techno tail)
+  let reverb = null;
+  if (cfg.reverb > 0) {
+    reverb = off.createConvolver();
+    const len = Math.ceil(SR * 2.6), ir = off.createBuffer(2, len, SR);
+    for (let ch = 0; ch < 2; ch++) { const d = ir.getChannelData(ch); for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3); }
+    reverb.buffer = ir;
+    const rg = off.createGain(); rg.gain.value = cfg.reverb;
+    reverb.connect(rg); rg.connect(comp);
+  }
+  const toReverb = node => { if (reverb) node.connect(reverb); };
+
+  // optional master filter-sweep intro (classic build) for extra arrangement variety
+  let outNode = comp;
+  const filterIntro = !cfg.float && rand() < 0.5;
+  if (filterIntro) {
+    const mf = off.createBiquadFilter(); mf.type = 'lowpass'; mf.Q.value = 1;
+    const sweepBars = pick([2, 4, 4]);
+    mf.frequency.setValueAtTime(320, t0);
+    mf.frequency.exponentialRampToValueAtTime(18000, t0 + sweepBars * 4 * BEAT);
+    mf.connect(comp); outNode = mf;
+  }
+
+  const hasKick = b => b >= kickStart && b < BARS - 1, hasBass = b => b >= kickStart + 2 && b < BARS - 2, hasChops = b => b >= (cfg.float ? 0 : Math.max(1, kickStart));
+  const hasClap = b => b >= kickStart + 2 && b < BARS - 2;
+
+  const drumBus = off.createGain(); drumBus.gain.value = 1; drumBus.connect(outNode);
+  function kick(t, soft) {
+    const o = off.createOscillator(), g = off.createGain();
+    o.frequency.setValueAtTime(soft ? 120 : 150, t);
+    o.frequency.exponentialRampToValueAtTime(soft ? 50 : 45, t + (soft ? 0.16 : 0.12));
+    g.gain.setValueAtTime(soft ? 0.85 : 1.0, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + (soft ? 0.34 : 0.28));
+    o.connect(g); g.connect(drumBus); o.start(t); o.stop(t + 0.36);
+    if (!soft) {
+      const n = off.createBufferSource(), nb = off.createBuffer(1, 220, SR);
+      const d = nb.getChannelData(0); for (let i = 0; i < 220; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / 220);
+      n.buffer = nb;
+      const ng = off.createGain(); ng.gain.value = 0.25;
+      n.connect(ng); ng.connect(drumBus); n.start(t);
+    }
+  }
+  const noiseBuf = off.createBuffer(1, SR, SR);
+  { const d = noiseBuf.getChannelData(0); for (let i = 0; i < SR; i++) d[i] = Math.random() * 2 - 1; }
+  function hat(t, open, soft) {
+    const s = off.createBufferSource(); s.buffer = noiseBuf;
+    const hp = off.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 8200;
+    const g = off.createGain();
+    const dur = open ? 0.14 : 0.045;
+    g.gain.setValueAtTime((open ? 0.32 : 0.25) * (soft ? 0.55 : 1), t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    s.connect(hp); hp.connect(g); g.connect(drumBus);
+    s.start(t, rand() * 0.4); s.stop(t + dur + 0.02);
+  }
+  function clap(t) {
+    for (const dt of [0, 0.012, 0.026]) {
+      const s = off.createBufferSource(); s.buffer = noiseBuf;
+      const bp = off.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1800; bp.Q.value = 1.1;
+      const g = off.createGain();
+      g.gain.setValueAtTime(dt === 0.026 ? 0.5 : 0.28, t + dt);
+      g.gain.exponentialRampToValueAtTime(0.001, t + dt + 0.12);
+      s.connect(bp); bp.connect(g); g.connect(drumBus); toReverb(g);
+      s.start(t + dt, rand() * 0.4); s.stop(t + dt + 0.15);
+    }
+  }
+  function rim(t) { // soft lo-fi backbeat
+    const s = off.createBufferSource(); s.buffer = noiseBuf;
+    const bp = off.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 2400; bp.Q.value = 2.5;
+    const g = off.createGain();
+    g.gain.setValueAtTime(0.3, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.06);
+    s.connect(bp); bp.connect(g); g.connect(drumBus); toReverb(g);
+    s.start(t, rand() * 0.4); s.stop(t + 0.08);
+  }
+  const openHatEvery = mood.energy > 0.64 ? pick([2, 2, 4]) : pick([4, 8, 8]);
+  if (!cfg.float && cfg.kick !== 'none') {
+    for (let bar = 0; bar < BARS; bar++) {
+      for (let b = 0; b < 4; b++) {
+        const t = beatAt(bar, b);
+        // kick
+        if (hasKick(bar)) {
+          if (cfg.kick === 'four') kick(t);
+          else if (cfg.kick === 'boombap' && (b === 0 || b === 2)) kick(t + (b === 2 ? BEAT * SWING : 0), true);
+        }
+        // hats
+        if (cfg.hat === 'offbeat') hat(t + BEAT * (0.5 + SWING), false);
+        else if (cfg.hat === 'driving') { hat(t, false, true); hat(t + BEAT * 0.5, false); }
+        else if (cfg.hat === 'lazy' && (b === 1 || b === 3)) hat(t + BEAT * (0.5 + SWING), false, true);
+        if (SIXTEENTHS && cfg.hat === 'offbeat' && bar >= 6 && bar < BARS - 2 && b % 2 === 1) hat(t + BEAT * 0.25, false);
+        // backbeat
+        if (cfg.clap === true && hasClap(bar) && (b === 1 || b === 3)) clap(t);
+        if (cfg.clap === 'rim' && (b === 1 || b === 3)) rim(t + BEAT * SWING);
+        if (cfg.hat === 'offbeat' && bar >= 4 && bar < BARS - 2 && b === 3 && bar % openHatEvery === openHatEvery - 1) hat(t + BEAT * (0.5 + SWING), true);
+      }
+    }
+  }
+
+  const pitched = clips.find(c => c.freq && c.freq > 60 && c.freq < 2000);
+  let rootMidi = pitched ? freqToMidi(pitched.freq) : 45;
+  while (rootMidi > 45) rootMidi -= 12; while (rootMidi < 33) rootMidi += 12;
+  const bassBus = off.createGain(); bassBus.gain.value = 0.55; bassBus.connect(outNode);
+  // harmony from the clips' tags: build a 2-bar bass pattern from the tag-derived scale,
+  // so birds→major, traffic→minor, mystery→phrygian each sound harmonically different
+  const sc = mood.scale.intervals;
+  const bassPattern = (() => {
+    const p = [];
+    for (let i = 0; i < 8; i++) {
+      if (i === 0 || i === 4) p.push(0);           // root on the strong beats
+      else if (rand() < 0.45) p.push(0);
+      else p.push(sc[Math.floor(rand() * sc.length)] + (rand() < 0.2 ? 12 : 0));
+    }
+    return p;
+  })();
+  function bassNote(t, midi, dur, wave, sweep) {
+    const o = off.createOscillator(); o.type = wave || 'sawtooth';
+    o.frequency.value = 440 * Math.pow(2, (midi - 69) / 12);
+    const lp = off.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = sweep ? 6 : 1;
+    if (sweep) { lp.frequency.setValueAtTime(cfg.dark ? 600 : 900, t); lp.frequency.exponentialRampToValueAtTime(220, t + dur); }
+    else lp.frequency.value = cfg.dark ? 500 : 800;
+    const g = off.createGain();
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.5, t + 0.012);
+    g.gain.setValueAtTime(0.5, t + dur - 0.04); g.gain.linearRampToValueAtTime(0, t + dur);
+    o.connect(lp); lp.connect(g); g.connect(bassBus);
+    o.start(t); o.stop(t + dur + 0.02);
+  }
+  if (cfg.bass === 'drone') {
+    for (const iv of [0, 7, 12]) {
+      const o = off.createOscillator(); o.type = 'sine';
+      o.frequency.value = 440 * Math.pow(2, (rootMidi - 12 + iv - 69) / 12);
+      const g = off.createGain();
+      g.gain.setValueAtTime(0, t0); g.gain.linearRampToValueAtTime(0.16, t0 + 3);
+      g.gain.setValueAtTime(0.16, TOTAL - 4); g.gain.linearRampToValueAtTime(0, TOTAL - 1);
+      o.connect(g); g.connect(outNode); toReverb(g); o.start(t0); o.stop(TOTAL);
+    }
+  } else {
+    for (let bar = 0; bar < BARS; bar++) {
+      if (!hasBass(bar)) continue;
+      for (let b = 0; b < 4; b++) {
+        if (cfg.bass === 'offbeat') bassNote(beatAt(bar, b) + BEAT * (0.5 + SWING), rootMidi + bassPattern[(bar % 2) * 4 + b], BEAT * 0.42, 'sawtooth', true);
+        else if (cfg.bass === 'rolling') { bassNote(beatAt(bar, b) + BEAT * 0.5, rootMidi, BEAT * 0.24, 'sawtooth', false); bassNote(beatAt(bar, b) + BEAT * 0.75, rootMidi, BEAT * 0.22, 'sawtooth', false); }
+        else if (cfg.bass === 'root' && (b === 0 || b === 2)) bassNote(beatAt(bar, b) + BEAT * (b === 2 ? 0.5 + SWING : 0), rootMidi + bassPattern[(bar % 2) * 4 + b] % 12, BEAT * 0.7, 'triangle', false);
+      }
+    }
+  }
+
+  // vinyl crackle bed for lo-fi
+  if (cfg.crackle) {
+    const s = off.createBufferSource(); s.buffer = noiseBuf; s.loop = true;
+    const hp = off.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 3000;
+    const g = off.createGain(); g.gain.value = 0.03;
+    s.connect(hp); hp.connect(g); g.connect(outNode); s.start(t0);
+  }
+
+  const lngs = clips.map(c => c.rec.lng);
+  const minLng = Math.min(...lngs), maxLng = Math.max(...lngs), lngSpan = maxLng - minLng || 1;
+  const panOf = c => Math.max(-0.85, Math.min(0.85, ((c.rec.lng - minLng) / lngSpan) * 2 - 1));
+  const longIdxs = clips.map((c, i) => i).filter(i => clips[i].buf.duration >= 5);
+  const atmoIdx = longIdxs.length ? pick(longIdxs) : clips.reduce((mi, c, i) => c.buf.duration > clips[mi].buf.duration ? i : mi, 0);
+  {
+    const c = clips[atmoIdx];
+    const s = off.createBufferSource(); s.buffer = c.buf; s.loop = true;
+    const lp = off.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = ATMO_LP;
+    const duck = off.createGain();
+    if (cfg.kick === 'none') { duck.gain.value = 0.32; }
+    else for (let bar = 0; bar < BARS; bar++) for (let b = 0; b < 4; b++) {
+      const t = beatAt(bar, b);
+      duck.gain.setValueAtTime(hasKick(bar) ? DUCK : 0.3, t);
+      duck.gain.linearRampToValueAtTime(0.34, t + BEAT * 0.72);
+    }
+    const g = off.createGain(); g.gain.value = 1;
+    s.connect(lp); lp.connect(duck); duck.connect(g); g.connect(outNode); toReverb(g);
+    s.start(t0);
+  }
+
+  const chopBus = off.createGain(); chopBus.gain.value = 0.9; chopBus.connect(outNode);
+  const chopClips = clips.filter((_, i) => i !== atmoIdx)
+    .map(c => ({ c, k: rand() })).sort((a, b) => a.k - b.k).map(x => x.c);
+  function playChop(clip, t, dur, wet) {
+    const onset = clip.onsets[Math.floor(rand() * clip.onsets.length)];
+    const s = off.createBufferSource(); s.buffer = clip.buf;
+    const pan = off.createStereoPanner(); pan.pan.value = panOf(clip);
+    const g = off.createGain();
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(0.85, t + Math.min(0.03, dur * 0.15));
+    g.gain.setValueAtTime(0.85, t + dur - 0.05);
+    g.gain.linearRampToValueAtTime(0, t + dur);
+    s.connect(g); g.connect(pan); pan.connect(chopBus); if (wet) toReverb(pan);
+    s.start(t, onset / clip.buf.sampleRate, dur + 0.05);
+  }
+  if (cfg.float) {
+    // ambient: each clip drifts in a few times, long and reverberant, no grid
+    chopClips.forEach((clip, i) => {
+      const hits = 1 + Math.floor(rand() * 2);
+      for (let h = 0; h < hits; h++) {
+        const t = t0 + rand() * (TOTAL - 5);
+        playChop(clip, t, 2 + rand() * 2.5, true);
+      }
+    });
+  } else {
+    const patternPool = [
+      [1, 2.5], [0.5, 2, 3.5], [1.5, 3], [0.75, 2.25, 3.5],
+      [2], [0.5, 1.5, 2.5, 3.5], [1, 1.75, 3], [0.25, 2, 2.75],
+    ];
+    const patterns = [];
+    for (let k = 0; k < 4; k++) {
+      const p = pick(patternPool);
+      patterns.push(CHOP_DENSITY < 0.35 ? p.slice(0, Math.max(1, p.length - 1)) : p);
+    }
+    for (let bar = 0; bar < BARS; bar++) {
+      if (!hasChops(bar) || !chopClips.length) continue;
+      const clip = chopClips[bar % chopClips.length];
+      const pat = patterns[bar % patterns.length];
+      for (const stepBeat of pat) {
+        const t = beatAt(bar, stepBeat + (stepBeat % 1 !== 0 ? SWING : 0));
+        const dur = BEAT * (rand() < 0.3 ? 0.9 : 0.45);
+        playChop(clip, t, dur, cfg.reverb > 0.15);
+      }
+    }
+  }
+
+  setStatus('rendering…');
+  const rendered = await off.startRendering();
+  const wav = encodeWav(rendered);
+  return { url: URL.createObjectURL(new Blob([wav], { type: 'audio/wav' })), BPM, BARS, genre: cfg.label };
+}
+
+async function openStudio() {
+  if (studioClose) { studioClose(); return; }
+
+  const overlay = el('div', { class: 'skyline-overlay' });
+  const tfBar = el('div', { class: 'tf-bar', style: 'border:none;padding:8px 0 0;' });
+  const head = el('div', { class: 'sky-head' },
+    el('div', {},
+      el('h3', {}, 'generate'),
+      el('p', {}, 'angle = hour it was captured · rings = distance from your point (move it on the little map) · click a ring to select a band, a burst to listen'),
+      tfBar),
+    el('button', { class: 'sky-close', onclick: () => studioClose && studioClose() }, '×')
+  );
+  const wrap = el('div', { class: 'sky-canvas-wrap' });
+  const canvas = el('canvas', { class: 'sky-canvas' });
+  const tip = el('div', { class: 'sky-tip' });
+  const status = el('div', { class: 'sky-status' }, 'decoding the city…');
+  const insetWrap = el('div', { style: 'position:absolute;left:22px;bottom:18px;width:200px;z-index:5;' },
+    el('div', { style: 'font-size:9px;letter-spacing:1px;color:var(--ink-light);text-transform:uppercase;margin-bottom:4px;' }, 'your point — click to move it'),
+    el('div', { id: 'studio-inset', style: 'width:200px;height:150px;border:1.5px solid #111;border-radius:10px;overflow:hidden;' }));
+  wrap.append(canvas, tip, status, insetWrap);
+
+  const strip = el('canvas', { style: 'width:100%;height:120px;display:block;flex-shrink:0;' });
+  const caption = el('div', { style: 'text-align:center;font-size:12px;color:var(--ink-light);font-style:italic;min-height:18px;padding:0 30px;flex-shrink:0;' });
+  const selLabel = el('span', { style: 'font-size:11px;color:var(--ink-light);letter-spacing:1px;text-transform:uppercase;' });
+  let genre = 'house';
+  const genreBar = el('div', { class: 'tf-bar', style: 'border:none;padding:0;gap:5px;' });
+  for (const [k, g] of Object.entries(GENRES)) {
+    genreBar.appendChild(el('button', {
+      class: `tf-btn${k === 'house' ? ' active' : ''}`, onclick(e) {
+        genreBar.querySelectorAll('.tf-btn').forEach(x => x.classList.remove('active'));
+        e.currentTarget.classList.add('active'); genre = k;
+      }
+    }, g.label));
+  }
+  const genBtn = el('button', { class: 'btn-generate', style: 'width:auto;padding:10px 26px;border-radius:100px;', onclick: doGenerate }, '▶ generate');
+  const result = el('span', { style: 'display:flex;align-items:center;gap:10px;' });
+  const controls = el('div', { style: 'display:flex;align-items:center;justify-content:center;gap:14px;padding:8px 30px 18px;flex-wrap:wrap;flex-shrink:0;' }, selLabel, genreBar, genBtn, result);
+  overlay.append(head, wrap, strip, caption, controls);
+  document.body.appendChild(overlay);
+
+  // anchor starts wherever the main map is looking
+  const c0 = map.getCenter();
+  studioAnchor = { lat: c0.lat, lng: c0.lng };
+  const inset = L.map('studio-inset', { zoomControl: false, attributionControl: false })
+    .setView([studioAnchor.lat, studioAnchor.lng], 10);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(inset);
+  const anchorDot = L.circleMarker([studioAnchor.lat, studioAnchor.lng],
+    { radius: 6, color: '#111', weight: 2, fillColor: '#fff', fillOpacity: 1 }).addTo(inset);
+  inset.on('click', e => {
+    studioAnchor = { lat: e.latlng.lat, lng: e.latlng.lng };
+    anchorDot.setLatLng(e.latlng);
+    updateSelLabel(); redraw();
+  });
+  setTimeout(() => inset.invalidateSize(), 60);
+
+  let clips = [], player = null, raf = null, playingIdx = -1;
+  let selBand = null;          // [loKm, hiKm) or null = whole city
+  let stripSegs = [], playingStrip = -1;
+  let currentTf = 'all', genCount = 0;
+  let nodes = [], geo = null;
+
+  for (const [v, l] of [['1h', 'Last hour'], ['24h', 'Last 24h'], ['7d', '7 days'], ['30d', '30 days'], ['all', 'All time']]) {
+    tfBar.appendChild(el('button', {
+      class: `tf-btn${v === 'all' ? ' active' : ''}`, onclick(e) {
+        tfBar.querySelectorAll('.tf-btn').forEach(x => x.classList.remove('active'));
+        e.currentTarget.classList.add('active');
+        currentTf = v; selBand = null; load();
+      }
+    }, l));
+  }
+
+  studioClose = () => {
+    stopAudio(); stopTrack();
+    window.removeEventListener('resize', redraw);
+    inset.remove();
+    overlay.remove(); studioClose = null;
+  };
+  function stopAudio() {
+    if (player) { player.pause(); player = null; }
+    if (raf) cancelAnimationFrame(raf);
+    playingIdx = -1; playingStrip = -1;
+  }
+
+  async function load() {
+    const g = ++genCount;
+    stopAudio();
+    if (!status.isConnected) wrap.appendChild(status);
+    status.textContent = 'decoding the city…';
+    try {
+      const p = new URLSearchParams();
+      if (currentTf !== 'all') p.append('since', sinceDate(currentTf));
+      const recs = await fetch(`${API}/api/recordings?${p}`).then(r => r.json());
+      const AC = new (window.AudioContext || window.webkitAudioContext)();
+      const out = [];
+      for (const rec of recs.slice(0, 24)) {
+        const cached = studioCache.get(rec.filename);
+        if (cached) { out.push({ rec, ...cached }); continue; }
+        try {
+          const ab = await fetch(`${API}/uploads/${rec.filename}`).then(r => r.arrayBuffer());
+          const buf = await AC.decodeAudioData(ab);
+          const an = analyzeBuffer(buf);
+          studioCache.set(rec.filename, { buf, ...an });
+          out.push({ rec, buf, ...an });
+        } catch {}
+      }
+      await AC.close();
+      if (g !== genCount) return;
+      clips = out;
+      if (clips.length) status.remove();
+      else status.textContent = 'no recordings in this window';
+      updateSelLabel();
+      redraw();
+    } catch { status.textContent = 'could not load recordings'; }
+  }
+
+  const BAND_EDGES = [0, 1, 2, 4, 7, 12, 25];
+  const maxKm = () => Math.max(8, ...clips.map(c => distKm(c.rec.lat, c.rec.lng))) * 1.1;
+  function bands() {
+    const mk = maxKm(), out = [];
+    for (let i = 0; i < BAND_EDGES.length - 1; i++) {
+      out.push([BAND_EDGES[i], BAND_EDGES[i + 1]]);
+      if (BAND_EDGES[i + 1] >= mk) break;
+    }
+    return out;
+  }
+  function inBand(c, b) { const k = distKm(c.rec.lat, c.rec.lng); return k >= b[0] && k < b[1]; }
+  function stripClips() { return selBand ? clips.filter(c => inBand(c, selBand)) : clips; }
+  function updateSelLabel() {
+    const n = stripClips().length;
+    selLabel.textContent = selBand
+      ? `${n} sound${n === 1 ? '' : 's'} · ${selBand[0]}–${selBand[1]} km from your point`
+      : `${n} sound${n === 1 ? '' : 's'} · the whole city`;
+    genBtn.disabled = n === 0;
+  }
+
+  function drawPolar(highlightIdx = -1, playFrac = null) {
+    const W = wrap.clientWidth, H = wrap.clientHeight, dpr = devicePixelRatio || 1;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, W, H);
+    if (!clips.length) { nodes = []; geo = null; return; }
+
+    const cx = W / 2, cy = H / 2;
+    const Rin = Math.min(W, H) * 0.10, Rout = Math.min(W, H) * 0.40;
+    const amp = Math.min(W, H) * 0.05;
+    const mk = maxKm();
+    const kmToR = km => Rin + Math.sqrt(Math.min(km / mk, 1)) * (Rout - Rin);
+    geo = { cx, cy, Rin, Rout, amp, kmToR, mk };
+
+    // hour spokes
+    ctx.strokeStyle = '#e6e6e6'; ctx.fillStyle = '#b5b5b5';
+    ctx.font = '10px Inter, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    for (let h = 0; h < 24; h += 6) {
+      const a = (h / 24) * Math.PI * 2 - Math.PI / 2;
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(a) * (Rin - 12), cy + Math.sin(a) * (Rin - 12));
+      ctx.lineTo(cx + Math.cos(a) * (Rout + amp + 6), cy + Math.sin(a) * (Rout + amp + 6));
+      ctx.stroke();
+      const lbl = h === 0 ? '12a' : h === 12 ? '12p' : (h % 12) + (h < 12 ? 'a' : 'p');
+      ctx.fillText(lbl, cx + Math.cos(a) * (Rout + amp + 22), cy + Math.sin(a) * (Rout + amp + 22));
+    }
+
+    // selected band wash
+    if (selBand) {
+      ctx.fillStyle = 'rgba(0,0,0,0.05)';
+      ctx.beginPath();
+      ctx.arc(cx, cy, kmToR(selBand[1]), 0, Math.PI * 2);
+      ctx.arc(cx, cy, kmToR(selBand[0]), 0, Math.PI * 2, true);
+      ctx.fill('evenodd');
+    }
+
+    // distance ring boundaries + labels
+    for (const b of bands()) {
+      const r = kmToR(b[1]);
+      const active = selBand && selBand[0] === b[0];
+      ctx.strokeStyle = active ? '#777' : '#dcdcdc'; ctx.lineWidth = 1;
+      ctx.setLineDash([2, 6]);
+      ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
+      ctx.setLineDash([]);
+      const la = -Math.PI * 0.72; // upper-left
+      ctx.fillStyle = active ? '#555' : '#c0c0c0'; ctx.font = '9px Inter, sans-serif';
+      ctx.fillText(`${b[1]} km`, cx + Math.cos(la) * r, cy + Math.sin(la) * r - 7);
+    }
+
+    // clips as waveform bursts
+    nodes = [];
+    for (let i = 0; i < clips.length; i++) {
+      const { rec, buf } = clips[i];
+      const d = new Date(rec.timestamp);
+      const theta = ((d.getHours() + d.getMinutes() / 60) / 24) * Math.PI * 2 - Math.PI / 2;
+      const r = kmToR(distKm(rec.lat, rec.lng));
+      const dimmed = selBand && !inBand(clips[i], selBand);
+      const hi = i === highlightIdx || i === playingIdx;
+
+      const raw = buf.getChannelData(0);
+      let peak = 0; for (let k = 0; k < raw.length; k += 50) peak = Math.max(peak, Math.abs(raw[k]));
+      const norm = peak ? 0.95 / peak : 1;
+      const arcW = Math.PI / 11, pts = 150;
+      ctx.strokeStyle = dimmed ? '#d0d0d0' : '#111';
+      ctx.lineWidth = hi ? 1.6 : 1.1;
+      ctx.beginPath();
+      for (let k = 0; k <= pts; k++) {
+        const f = k / pts;
+        const a = theta - arcW / 2 + f * arcW;
+        const v = raw[Math.floor(f * (raw.length - 1))] * norm;
+        const rr = r + v * amp * (hi ? 1 : 0.8);
+        const x = cx + Math.cos(a) * rr, y = cy + Math.sin(a) * rr;
+        k === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+
+      const lx = cx + Math.cos(theta) * (r + amp + 12), ly = cy + Math.sin(theta) * (r + amp + 12);
+      ctx.fillStyle = hi ? '#111' : dimmed ? '#d0d0d0' : '#9a9a9a';
+      ctx.font = `${hi ? '700 ' : ''}9px Inter, sans-serif`;
+      ctx.fillText(((rec.tags && rec.tags[0]) || 'sound').toUpperCase(), lx, ly);
+
+      if (i === playingIdx && playFrac !== null) {
+        const a = theta - arcW / 2 + playFrac * arcW;
+        ctx.fillStyle = '#111';
+        ctx.beginPath(); ctx.arc(cx + Math.cos(a) * r, cy + Math.sin(a) * r, 3.5, 0, Math.PI * 2); ctx.fill();
+      }
+      nodes.push({ x: cx + Math.cos(theta) * r, y: cy + Math.sin(theta) * r, i });
+    }
+
+    // the heart
+    ctx.fillStyle = '#111';
+    ctx.font = '700 20px Space Grotesk, Inter, sans-serif';
+    ctx.fillText(String(clips.length), cx, cy - 7);
+    ctx.fillStyle = '#9a9a9a'; ctx.font = '8.5px Inter, sans-serif';
+    ctx.fillText('SOUNDS AROUND', cx, cy + 10);
+    ctx.fillText('YOUR POINT', cx, cy + 21);
+  }
+
+  function drawStrip(highlightIdx = -1, playX = null) {
+    const W = strip.clientWidth, H = strip.clientHeight, dpr = devicePixelRatio || 1;
+    strip.width = W * dpr; strip.height = H * dpr;
+    const ctx = strip.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, W, H);
+    const sel = stripClips().slice().sort((a, b) => a.rec.lng - b.rec.lng);
+    stripSegs = [];
+    if (!sel.length) return;
+
+    const lngs = sel.map(c => c.rec.lng);
+    const minLng = Math.min(...lngs), span = (Math.max(...lngs) - minLng) || 1;
+    const padL = 46, padR = 46, gap = 16;
+    const segW = Math.max(24, Math.min(90, (W - padL - padR - gap * (sel.length - 1)) / sel.length));
+    let xs = sel.map(c => padL + ((c.rec.lng - minLng) / span) * (W - padL - padR - segW));
+    for (let i = 1; i < xs.length; i++) if (xs[i] < xs[i - 1] + segW + gap) xs[i] = xs[i - 1] + segW + gap;
+    if (xs.length) {
+      xs[xs.length - 1] = Math.min(xs[xs.length - 1], W - padR - segW);
+      for (let i = xs.length - 2; i >= 0; i--) if (xs[i] + segW + gap > xs[i + 1]) xs[i] = xs[i + 1] - gap - segW;
+    }
+
+    const base = H * 0.44, amp = H * 0.3;
+    ctx.lineWidth = 1.2; ctx.strokeStyle = '#111'; ctx.lineJoin = 'round';
+    ctx.beginPath(); ctx.moveTo(0, base);
+    for (let si = 0; si < sel.length; si++) {
+      const c = sel[si], x = xs[si];
+      ctx.lineTo(x, base);
+      const raw = c.buf.getChannelData(0);
+      let peak = 0; for (let k = 0; k < raw.length; k += 50) peak = Math.max(peak, Math.abs(raw[k]));
+      const norm = peak ? 0.95 / peak : 1;
+      const pts = Math.floor(segW * 2);
+      for (let k = 0; k < pts; k++) {
+        const v = raw[Math.floor(k * raw.length / pts)] * norm;
+        ctx.lineTo(x + (k / pts) * segW, base - v * amp * (si === highlightIdx || si === playingStrip ? 1 : 0.8));
+      }
+      ctx.lineTo(x + segW, base);
+      stripSegs.push({ x, w: segW, c });
+    }
+    ctx.lineTo(W, base);
+    ctx.stroke();
+
+    ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+    for (let si = 0; si < stripSegs.length; si++) {
+      const { x, w, c } = stripSegs[si];
+      const hi = si === highlightIdx || si === playingStrip;
+      ctx.fillStyle = hi ? '#111' : '#9a9a9a';
+      ctx.font = `${hi ? '700 ' : ''}9px Inter, sans-serif`;
+      ctx.fillText(((c.rec.tags && c.rec.tags[0]) || 'sound').toUpperCase(), x + w / 2, H - (si % 2 ? 4 : 14));
+    }
+    ctx.fillStyle = '#c2c2c2'; ctx.font = '9px Inter, sans-serif';
+    ctx.textAlign = 'left'; ctx.fillText('W ◀', 12, 12);
+    ctx.textAlign = 'right'; ctx.fillText('▶ E', W - 12, 12);
+
+    if (playX !== null) {
+      ctx.strokeStyle = '#111'; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(playX, base - amp - 2); ctx.lineTo(playX, base + amp + 2); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+
+  function redraw() { drawPolar(); drawStrip(); }
+
+  function polarHit(mx, my) {
+    let best = -1, bd = 30 * 30;
+    for (const n of nodes) {
+      const d = (n.x - mx) ** 2 + (n.y - my) ** 2;
+      if (d < bd) { bd = d; best = n.i; }
+    }
+    if (best >= 0) return { type: 'node', i: best };
+    if (geo) {
+      const dr = Math.hypot(mx - geo.cx, my - geo.cy);
+      if (dr > geo.Rin * 0.4 && dr < geo.Rout + geo.amp) {
+        // invert sqrt mapping to km
+        const km = ((dr - geo.Rin) / (geo.Rout - geo.Rin)) ** 2 * geo.mk;
+        const b = bands().find(b => km >= b[0] && km < b[1]);
+        if (b) return { type: 'band', band: b };
+      }
+    }
+    return null;
+  }
+
+  function playClip(clipEntry, onFrame, onDone) {
+    stopAudio();
+    player = new Audio(`${API}/uploads/${clipEntry.rec.filename}`);
+    player.play();
+    caption.textContent = '“' + promptFor(clipEntry.rec) + '”';
+    const step = () => {
+      if (!player || player.ended || player.paused) { onDone(); return; }
+      onFrame(player.currentTime / (player.duration || 1));
+      raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+  }
+
+  canvas.addEventListener('mousemove', e => {
+    const r = canvas.getBoundingClientRect();
+    const hit = polarHit(e.clientX - r.left, e.clientY - r.top);
+    canvas.style.cursor = hit ? 'pointer' : 'default';
+    if (hit && hit.type === 'node') {
+      const c = clips[hit.i];
+      tip.textContent = `${(c.rec.tags || []).join(' · ')} — ${distKm(c.rec.lat, c.rec.lng).toFixed(1)} km out, ${new Date(c.rec.timestamp).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`;
+      const n = nodes.find(n => n.i === hit.i);
+      tip.style.left = n.x + 'px'; tip.style.top = (n.y - 14) + 'px';
+      tip.style.opacity = 1;
+      if (playingIdx < 0) drawPolar(hit.i);
+    } else if (hit && hit.type === 'band') {
+      tip.textContent = `${hit.band[0]}–${hit.band[1]} km from your point — click to select`;
+      tip.style.left = (e.clientX - r.left) + 'px'; tip.style.top = (e.clientY - r.top - 8) + 'px';
+      tip.style.opacity = 1;
+      if (playingIdx < 0) drawPolar();
+    } else {
+      tip.style.opacity = 0;
+      if (playingIdx < 0) drawPolar();
+    }
+  });
+  canvas.addEventListener('mouseleave', () => { tip.style.opacity = 0; if (playingIdx < 0) drawPolar(); });
+  canvas.addEventListener('click', e => {
+    const r = canvas.getBoundingClientRect();
+    const hit = polarHit(e.clientX - r.left, e.clientY - r.top);
+    if (!hit) return;
+    if (hit.type === 'node') {
+      playingIdx = hit.i;
+      playClip(clips[hit.i], f => drawPolar(hit.i, f), () => { playingIdx = -1; drawPolar(); });
+    } else {
+      selBand = (selBand && selBand[0] === hit.band[0]) ? null : hit.band;
+      updateSelLabel(); redraw();
+    }
+  });
+
+  strip.addEventListener('mousemove', e => {
+    const r = strip.getBoundingClientRect();
+    const mx = e.clientX - r.left;
+    const idx = stripSegs.findIndex(s => mx >= s.x - 3 && mx <= s.x + s.w + 3);
+    strip.style.cursor = idx >= 0 ? 'pointer' : 'default';
+    if (playingStrip < 0) drawStrip(idx);
+  });
+  strip.addEventListener('mouseleave', () => { if (playingStrip < 0) drawStrip(); });
+  strip.addEventListener('click', e => {
+    const r = strip.getBoundingClientRect();
+    const mx = e.clientX - r.left;
+    const idx = stripSegs.findIndex(s => mx >= s.x - 3 && mx <= s.x + s.w + 3);
+    if (idx < 0) return;
+    const seg = stripSegs[idx];
+    playingStrip = idx;
+    playClip(seg.c, f => drawStrip(idx, seg.x + f * seg.w), () => { playingStrip = -1; drawStrip(); });
+  });
+
+  let trackAudio = null;
+  function stopTrack() { if (trackAudio) { trackAudio.pause(); trackAudio = null; } }
+  async function doGenerate() {
+    const sel = stripClips();
+    if (!sel.length) return;
+    stopAudio(); stopTrack();
+    genBtn.disabled = true; result.innerHTML = '';
+    try {
+      const { url, BPM, genre: gLabel } = await generateTrack(sel, currentTf + (selBand ? selBand.join('-') : 'city'), genre,
+        s => { selLabel.textContent = s; });
+      trackAudio = new Audio(url);
+      const playBtn = el('button', { class: 'btn-tool', style: 'padding:8px 16px;', onclick() {
+        if (trackAudio.paused) trackAudio.play(); else trackAudio.pause();
+      } }, '❚❚ pause');
+      const setLbl = () => { playBtn.innerHTML = trackAudio.paused ? '<span class="tool-glyph">▶</span> play' : '<span class="tool-glyph">❚❚</span> pause'; };
+      // seekable progress bar
+      const fmt = s => { s = Math.max(0, s | 0); return (s / 60 | 0) + ':' + String(s % 60).padStart(2, '0'); };
+      const fill = el('div', { style: 'height:100%;width:0;background:#111;border-radius:3px;' });
+      const bar = el('div', {
+        style: 'position:relative;width:150px;height:6px;background:#e2e2e2;border-radius:3px;cursor:pointer;',
+        onclick(e) { const r = bar.getBoundingClientRect(); trackAudio.currentTime = ((e.clientX - r.left) / r.width) * (trackAudio.duration || 0); }
+      }, fill);
+      const timeLbl = el('span', { style: 'font-size:10px;color:var(--ink-light);min-width:72px;font-variant-numeric:tabular-nums;' }, '0:00 / 0:00');
+      trackAudio.ontimeupdate = () => { const d = trackAudio.duration || 1; fill.style.width = (100 * trackAudio.currentTime / d) + '%'; timeLbl.textContent = `${fmt(trackAudio.currentTime)} / ${fmt(d)}`; };
+      trackAudio.onplay = setLbl; trackAudio.onpause = setLbl; trackAudio.onended = () => { setLbl(); fill.style.width = '0'; };
+      trackAudio.play();
+      result.append(
+        playBtn, bar, timeLbl,
+        el('a', { class: 'btn-dl', style: 'padding:8px 14px;', href: url, download: `city-${gLabel}.wav` }, '↓ wav'),
+        el('span', { style: 'font-size:11px;color:var(--ink-light);' }, `${gLabel} · ${BPM} bpm · ${sel.length} sounds`)
+      );
+    } catch (e) { console.error(e); selLabel.textContent = 'error: ' + e.message; }
+    updateSelLabel();
+    genBtn.disabled = false;
+  }
+
+  window.addEventListener('resize', redraw);
+  load();
+}
+
 
 /* ── Audio utils ── */
 function encodeWav(buf){
